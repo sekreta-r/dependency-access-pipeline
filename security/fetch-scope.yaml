@@ -1,0 +1,76 @@
+# ====================================================================
+# Политика загрузки и зеркалирования обновлений безопасности
+# (fetch_artifact) для пайплайна тестирования обновлений безопасности
+# по Методике ФСТЭК 2022 г.
+# ====================================================================
+#
+# Назначение
+#   Реализовать принцип supply chain isolation: upstream-обновления
+#   безопасности однократно проходят через контролируемую границу
+#   периметра (джоба fetch_artifact в пайплайне на master), зеркалируются
+#   во внутренний PyPI-реестр проекта, после чего вся последующая
+#   обработка (security-тесты, сборка production-образа) ведётся
+#   исключительно с зеркалированным артефактом.
+#
+# Контекст по Методике
+#   П. 2.1 Методики требует фиксации атрибутов обновления (разработчик,
+#   место размещения, контрольные суммы, дата, версия).
+#   П. 3.2 Методики (тест Т001) предусматривает сверку идентичности
+#   обновлений из не менее чем двух источников.
+#
+#   Источники, верифицируемые в данной джобе:
+#     1. PyPI JSON API     — канонические метаданные релиза (SHA256)
+#     2. PyPI download      — фактический wheel-файл
+#     3. Internal Registry  — зеркало (при повторных прогонах
+#                              и на ветке ci/bump-*)
+#
+# Контексты запуска
+#   1. Пайплайн на master (по триггеру от scikit-learn):
+#      - получает RUNTIME/VERSION из CI_NEW_VERSION/CI_MLSERVER_RUNTIME_NAME
+#      - первичное зеркалирование с PyPI в Registry (3 источника)
+#   2. Пайплайн на ветке ci/bump-* (после push update_submodule_and_lock):
+#      - получает RUNTIME/VERSION из имени ветки
+#      - подгрузка из Registry (PyPI не дёргается, 2 источника)
+#      - передача wheel через GitLab artifacts в security-джобы
+
+upstream:
+  registry:
+    name: "PyPI"
+    package_index_url: "https://pypi.org/simple/"
+    metadata_url_template: "https://pypi.org/pypi/{name}/{version}/json"
+
+internal_mirror:
+  registry:
+    type: "gitlab_pypi"
+    project_scope: "current"
+    rationale: >-
+      PyPI-совместимый Package Registry того же проекта ml-serving-platform.
+      Это позволяет Poetry в build_image тянуть зеркалированный артефакт
+      через стандартный механизм tool.poetry.source с priority=primary,
+      без специальных переключений в pyproject.
+
+  auth:
+    method: "JOB-TOKEN"
+    token_variable: "CI_JOB_TOKEN"
+
+algorithm:
+  step_1: "Разбор RUNTIME/VERSION из триггер-переменных (master) или имени ветки (ci/bump-*)."
+  step_2: "Запрос PyPI Simple Index внутреннего Registry на наличие пакета."
+  step_3a: "При наличии — загрузка из Registry, сверка SHA256 (sources_count=2)."
+  step_3b: "При отсутствии — pip download с PyPI + сверка с PyPI JSON API + twine upload + повторная сверка (sources_count=3)."
+  step_4: "Эмиссия артефакта в artifacts/wheel/ + dotenv-признаков."
+
+dotenv_schema:
+  WHEEL_FILENAME:          "имя файла wheel"
+  WHEEL_RUNTIME:           "имя runtime-пакета"
+  WHEEL_VERSION:           "версия обновления"
+  WHEEL_SIZE_BYTES:        "размер (для отчёта Приложения № 2)"
+  WHEEL_SHA256:            "SHA256 артефакта (п. 4.2(б))"
+  WHEEL_SOURCE:            "internal_mirror | pypi_upstream"
+  WHEEL_DOWNLOAD_URL_PYPI: "канонический URL upstream"
+  WHEEL_REGISTRY_URL:      "URL во внутреннем реестре"
+  WHEEL_UPLOAD_DATE:       "ISO 8601, дата зеркалирования"
+  T001_VERIFIED:           "результат теста Т001"
+  T001_SOURCES_COUNT:      "число фактически сверенных источников"
+  WHEEL_FOUND:             "true/false"
+  FETCH_SCAN_ERROR:        "true/false"
