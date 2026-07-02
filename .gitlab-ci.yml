@@ -1,0 +1,3071 @@
+stages:
+  - prepare
+  - security
+  - build
+  - image_security
+  - deploy
+  - post_deploy_security
+  - normalization
+  - decision
+
+variables:
+  GIT_STRATEGY: clone
+  GIT_DEPTH: "0"
+  GIT_SUBMODULE_STRATEGY: recursive
+
+fetch_artifact:
+  stage: prepare
+  image: python:3.11-slim
+
+  before_script:
+    - set -euo pipefail
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates curl jq
+    - rm -rf /var/lib/apt/lists/*
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+    - export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    - export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    - python -m pip install --upgrade pip
+    - python -m pip install --upgrade twine
+    - twine --version
+    - jq --version
+
+  script:
+    - mkdir -p artifacts/wheel
+
+    - |
+      if [ -n "${CI_NEW_VERSION:-}" ] && [ -n "${CI_MLSERVER_RUNTIME_NAME:-}" ]; then
+        RUNTIME="$CI_MLSERVER_RUNTIME_NAME"
+        VERSION="$CI_NEW_VERSION"
+      else
+        REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+        VERSION="${REST##*-}"
+        RUNTIME="${REST%-${VERSION}}"
+      fi
+
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+      if [ -z "$RUNTIME" ] || [ -z "$VERSION" ] || [ "$RUNTIME" = "$VERSION" ]; then
+        echo "ERROR: cannot determine RUNTIME/VERSION"
+        echo "       CI_NEW_VERSION=${CI_NEW_VERSION:-<unset>}"
+        echo "       CI_MLSERVER_RUNTIME_NAME=${CI_MLSERVER_RUNTIME_NAME:-<unset>}"
+        echo "       CI_COMMIT_REF_NAME=$CI_COMMIT_REF_NAME"
+        exit 1
+      fi
+
+    - |
+      POLICY="security/fetch-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      cp "$POLICY" artifacts/fetch-scope.yaml
+
+    - |
+      REGISTRY_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi"
+      NORMALIZED_NAME=$(echo "$RUNTIME" | tr '[:upper:]_' '[:lower:]-')
+      SIMPLE_INDEX_URL="${REGISTRY_BASE}/simple/${NORMALIZED_NAME}/"
+
+    - |
+      PACKAGES_API_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages?package_type=pypi&package_name=${NORMALIZED_NAME}"
+
+      HTTP_CODE=$(curl -s -o /tmp/packages.json -w "%{http_code}" \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "$PACKAGES_API_URL" || echo "000")
+
+      WHEEL_IN_MIRROR="false"
+      WHEEL_FILENAME=""
+      PACKAGE_ID=""
+      EXPECTED_SHA=""
+
+      if [ "$HTTP_CODE" = "200" ]; then
+        PACKAGE_ID=$(jq -r --arg ver "$VERSION" --arg name "$NORMALIZED_NAME" \
+          '[.[] | select(.name == $name and .version == $ver)] | .[0].id // empty' \
+          /tmp/packages.json)
+
+        if [ -n "$PACKAGE_ID" ] && [ "$PACKAGE_ID" != "null" ]; then
+          FILES_API_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${PACKAGE_ID}/package_files"
+
+          curl -fsS --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+            "$FILES_API_URL" > /tmp/files.json
+
+          WHEEL_FILENAME=$(jq -r \
+            '[.[] | select(.file_name | endswith(".whl"))] | .[0].file_name // empty' \
+            /tmp/files.json)
+
+          EXPECTED_SHA=$(jq -r --arg fn "$WHEEL_FILENAME" \
+            '.[] | select(.file_name == $fn) | .file_sha256 // empty' \
+            /tmp/files.json | head -1)
+
+          if [ -n "$WHEEL_FILENAME" ] && [ "$WHEEL_FILENAME" != "null" ]; then
+            WHEEL_IN_MIRROR="true"
+          fi
+        fi
+      elif [ "$HTTP_CODE" = "404" ]; then
+        echo "Package ${NORMALIZED_NAME} not in registry"
+      else
+        echo "WARNING: unexpected HTTP code $HTTP_CODE"
+      fi
+
+    - |
+      WHEEL_SOURCE=""
+      WHEEL_SHA256=""
+      WHEEL_REGISTRY_URL=""
+      WHEEL_DOWNLOAD_URL_PYPI=""
+      WHEEL_UPLOAD_DATE=""
+      T001_VERIFIED="not_applicable"
+      T001_SOURCES_COUNT=0
+      T002_VERIFIED="false"
+      SUPPLY_VERIFIED="false"
+
+    - |
+      if [ "$WHEEL_IN_MIRROR" = "true" ]; then
+        echo "=== Registry artifact present: cross-source verification ==="
+
+        WHEEL_PATH="artifacts/wheel/${WHEEL_FILENAME}"
+        DOWNLOAD_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi/files/${EXPECTED_SHA}/${WHEEL_FILENAME}"
+
+        curl -fsSL \
+          --user "gitlab-ci-token:${CI_JOB_TOKEN}" \
+          --output "$WHEEL_PATH" \
+          "$DOWNLOAD_URL"
+
+        if [ ! -f "$WHEEL_PATH" ]; then
+          echo "FATAL: failed to download wheel from registry"
+          exit 1
+        fi
+
+        WHEEL_SHA256=$(sha256sum "$WHEEL_PATH" | awk '{print $1}')
+        echo "Registry file SHA256: $WHEEL_SHA256"
+
+        if [ -z "$EXPECTED_SHA" ] || [ "$EXPECTED_SHA" = "null" ]; then
+          echo "FATAL: registry did not provide SHA256"
+          exit 1
+        fi
+        if [ "$EXPECTED_SHA" != "$WHEEL_SHA256" ]; then
+          echo "FATAL: registry-stored SHA256 does not match downloaded file"
+          exit 1
+        fi
+
+        METADATA_URL="https://pypi.org/pypi/${RUNTIME}/${VERSION}/json"
+        if ! METADATA=$(curl -fsSL "$METADATA_URL"); then
+          echo "FATAL: cannot reach PyPI for cross-source verification"
+          exit 1
+        fi
+
+        mkdir -p /tmp/wheel-upstream
+        if ! pip download "${RUNTIME}==${VERSION}" \
+              --no-deps \
+              --dest /tmp/wheel-upstream \
+              --index-url "https://pypi.org/simple/" 2>&1 | tail -10; then
+          echo "FATAL: cannot download upstream wheel from PyPI"
+          exit 1
+        fi
+
+        UPSTREAM_PATH=$(find /tmp/wheel-upstream -name "*.whl" | head -1)
+        if [ -z "$UPSTREAM_PATH" ]; then
+          echo "FATAL: PyPI download did not produce a wheel"
+          exit 1
+        fi
+
+        UPSTREAM_FILENAME=$(basename "$UPSTREAM_PATH")
+        UPSTREAM_SHA256=$(sha256sum "$UPSTREAM_PATH" | awk '{print $1}')
+
+        PYPI_SHA256=$(echo "$METADATA" \
+          | jq -r --arg fn "$UPSTREAM_FILENAME" \
+            '.urls[] | select(.filename == $fn) | .digests.sha256')
+
+        if [ -z "$PYPI_SHA256" ] || [ "$PYPI_SHA256" = "null" ]; then
+          echo "FATAL: PyPI metadata has no SHA256 for $UPSTREAM_FILENAME"
+          exit 1
+        fi
+
+        if [ "$PYPI_SHA256" != "$UPSTREAM_SHA256" ]; then
+          echo "FATAL: PyPI upstream file does not match its canonical digest"
+          exit 1
+        fi
+        T002_VERIFIED="true"
+
+        if [ "$UPSTREAM_SHA256" != "$WHEEL_SHA256" ]; then
+          echo "FATAL: registry artifact does not match PyPI upstream (T001 failed)"
+          exit 1
+        fi
+
+        T001_VERIFIED="true"
+        T001_SOURCES_COUNT=2
+        SUPPLY_VERIFIED="true"
+
+        WHEEL_SOURCE="internal_mirror"
+        WHEEL_REGISTRY_URL="$DOWNLOAD_URL"
+        WHEEL_DOWNLOAD_URL_PYPI=$(echo "$METADATA" \
+          | jq -r --arg fn "$UPSTREAM_FILENAME" \
+            '.urls[] | select(.filename == $fn) | .url')
+
+        echo "T001 verified: registry == PyPI upstream"
+        echo "T002 verified: PyPI upstream == canonical digest"
+      fi
+
+    - |
+      if [ "$WHEEL_IN_MIRROR" != "true" ]; then
+        echo "=== First-time fetch from PyPI ==="
+
+        METADATA_URL="https://pypi.org/pypi/${RUNTIME}/${VERSION}/json"
+        if ! METADATA=$(curl -fsSL "$METADATA_URL"); then
+          echo "FATAL: cannot fetch PyPI metadata for ${RUNTIME}==${VERSION}"
+          exit 1
+        fi
+
+        mkdir -p /tmp/wheel-download
+        if ! pip download "${RUNTIME}==${VERSION}" \
+              --no-deps \
+              --dest /tmp/wheel-download \
+              --index-url "https://pypi.org/simple/" 2>&1 | tail -10; then
+          echo "FATAL: pip download failed"
+          exit 1
+        fi
+
+        WHEEL_PATH=$(find /tmp/wheel-download -name "*.whl" | head -1)
+        if [ -z "$WHEEL_PATH" ]; then
+          echo "FATAL: pip download did not produce a wheel"
+          exit 1
+        fi
+
+        WHEEL_FILENAME=$(basename "$WHEEL_PATH")
+        WHEEL_SHA256=$(sha256sum "$WHEEL_PATH" | awk '{print $1}')
+
+        PYPI_SHA256=$(echo "$METADATA" \
+          | jq -r --arg fn "$WHEEL_FILENAME" \
+            '.urls[] | select(.filename == $fn) | .digests.sha256')
+
+        if [ -z "$PYPI_SHA256" ] || [ "$PYPI_SHA256" = "null" ]; then
+          echo "FATAL: PyPI metadata does not contain SHA256 for $WHEEL_FILENAME"
+          exit 1
+        fi
+
+        if [ "$PYPI_SHA256" != "$WHEEL_SHA256" ]; then
+          echo "FATAL: SHA256 mismatch against PyPI canonical digest"
+          exit 1
+        fi
+
+        T002_VERIFIED="true"
+        T001_VERIFIED="not_applicable"
+        T001_SOURCES_COUNT=1
+        SUPPLY_VERIFIED="true"
+
+        WHEEL_DOWNLOAD_URL_PYPI=$(echo "$METADATA" \
+          | jq -r --arg fn "$WHEEL_FILENAME" \
+            '.urls[] | select(.filename == $fn) | .url')
+
+        cd /tmp/wheel-download
+        TWINE_PASSWORD="${CI_JOB_TOKEN}" \
+        TWINE_USERNAME="gitlab-ci-token" \
+        twine upload --verbose \
+          --repository-url "${REGISTRY_BASE}" \
+          "${WHEEL_FILENAME}" 2>&1 | tail -20
+        cd "${CI_PROJECT_DIR}"
+
+        mkdir -p artifacts/wheel
+        cp "$WHEEL_PATH" "artifacts/wheel/${WHEEL_FILENAME}"
+
+        WHEEL_SOURCE="pypi_upstream"
+        WHEEL_REGISTRY_URL="${REGISTRY_BASE}/simple/${NORMALIZED_NAME}/"
+
+        echo "T002 verified: PyPI upstream == canonical digest"
+        echo "T001 not applicable: no operator-supplied second instance"
+      fi
+
+    - |
+      WHEEL_PATH="artifacts/wheel/${WHEEL_FILENAME}"
+
+      WHEEL_FOUND="true"
+      [ -f "$WHEEL_PATH" ] || WHEEL_FOUND="false"
+
+      if [ "$WHEEL_FOUND" = "true" ]; then
+        WHEEL_SIZE_BYTES=$(stat -c%s "$WHEEL_PATH" 2>/dev/null || stat -f%z "$WHEEL_PATH")
+      else
+        WHEEL_SIZE_BYTES=0
+      fi
+
+      FETCH_SCAN_ERROR="false"
+      [ "$WHEEL_FOUND" = "false" ] && FETCH_SCAN_ERROR="true"
+
+      if [ "$WHEEL_FOUND" != "true" ] || [ "$T002_VERIFIED" != "true" ]; then
+        SUPPLY_VERIFIED="false"
+      fi
+
+      {
+        echo "WHEEL_FILENAME=${WHEEL_FILENAME}"
+        echo "WHEEL_RUNTIME=${RUNTIME}"
+        echo "WHEEL_VERSION=${VERSION}"
+        echo "WHEEL_SIZE_BYTES=${WHEEL_SIZE_BYTES}"
+        echo "WHEEL_SHA256=${WHEEL_SHA256}"
+        echo "WHEEL_SOURCE=${WHEEL_SOURCE}"
+        echo "WHEEL_DOWNLOAD_URL_PYPI=${WHEEL_DOWNLOAD_URL_PYPI}"
+        echo "WHEEL_REGISTRY_URL=${WHEEL_REGISTRY_URL}"
+        echo "WHEEL_UPLOAD_DATE=${WHEEL_UPLOAD_DATE}"
+        echo "T001_VERIFIED=${T001_VERIFIED}"
+        echo "T001_SOURCES_COUNT=${T001_SOURCES_COUNT}"
+        echo "T002_VERIFIED=${T002_VERIFIED}"
+        echo "SUPPLY_VERIFIED=${SUPPLY_VERIFIED}"
+        echo "WHEEL_FOUND=${WHEEL_FOUND}"
+        echo "FETCH_SCAN_ERROR=${FETCH_SCAN_ERROR}"
+      } > artifacts/fetch.env
+
+      cat artifacts/fetch.env
+      cp artifacts/fetch.env fetch.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/wheel/
+      - artifacts/fetch-scope.yaml
+      - artifacts/fetch.env
+      - fetch.env
+    reports:
+      dotenv: fetch.env
+
+update_submodule_and_lock:
+  stage: prepare
+  needs:
+    - fetch_artifact 
+  image: python:3.11-slim
+  before_script:
+    - set -euo pipefail
+
+    - apt-get update
+    - apt-get install -y --no-install-recommends git ca-certificates
+    - rm -rf /var/lib/apt/lists/*
+
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+
+    - export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    - export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    - git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+
+    - git config --global user.name "gitlab-ci"
+    - git config --global user.email "gitlab-ci@${CI_SERVER_HOST}"
+
+    - git config --global url."https://oauth2:${GITLAB_TOKEN}@gitlab.example.com:8000/".insteadOf "https://gitlab.example.com:8000/"
+
+    - python -m pip install --upgrade pip
+    - python -m pip install "poetry==1.8.5"
+
+    - poetry config http-basic.internal gitlab-ci-token "$CI_JOB_TOKEN"
+
+    - poetry --version
+    - python3 --version
+  script:
+    - |
+      : "${CI_MLSERVER_RUNTIME_NAME:?CI_MLSERVER_RUNTIME_NAME is empty}"
+      : "${CI_MLSERVER_RUNTIME_COMMIT:?CI_MLSERVER_RUNTIME_COMMIT is empty}"
+      : "${CI_NEW_VERSION:?CI_NEW_VERSION is empty}"
+
+    - BRANCH_NAME="ci/bump-${CI_MLSERVER_RUNTIME_NAME}-${CI_NEW_VERSION}"
+    - git checkout -B "$BRANCH_NAME"
+
+    - git submodule sync --recursive
+    - git submodule update --init --recursive
+
+    - cd "runtimes/${CI_MLSERVER_RUNTIME_NAME}"
+    - git fetch --all --tags
+    - git checkout "${CI_MLSERVER_RUNTIME_COMMIT}"
+    - cd ../..
+
+    - git add "runtimes/${CI_MLSERVER_RUNTIME_NAME}"
+
+    - poetry lock
+    - git add poetry.lock pyproject.toml
+    - |
+      if git diff --cached --quiet; then
+        echo "No changes detected, nothing to commit"
+        exit 0
+      fi
+
+    - |
+      git commit -m "ci: bump ${CI_MLSERVER_RUNTIME_NAME} runtime to ${CI_NEW_VERSION}"
+    - git remote set-url origin "https://oauth2:${PUSH_TOKEN}@gitlab.example.com:8000/root/ml-serving-platform.git"
+    - git push --set-upstream origin "$BRANCH_NAME"
+    - TAG="mlserver-${CI_MLSERVER_RUNTIME_NAME}-${CI_NEW_VERSION}"
+    - git tag -a "$TAG" -m "runtime bump"
+    - git push origin "$TAG"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: on_success
+    - when: never
+
+bandit_and_sbom:
+  stage: security
+  image: python:3.11-slim
+  needs:
+    - job: fetch_artifact
+      artifacts: true
+
+  before_script:
+    - set -euo pipefail
+
+    - apt-get update
+    - apt-get install -y --no-install-recommends git ca-certificates jq curl
+    - rm -rf /var/lib/apt/lists/*
+
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+
+    - export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    - export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    - git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+
+    - git config --global user.name "gitlab-ci"
+    - git config --global user.email "gitlab-ci@${CI_SERVER_HOST}"
+    - git config --global url."https://oauth2:${GITLAB_TOKEN}@gitlab.example.com:8000/".insteadOf "https://gitlab.example.com:8000/"
+
+    - curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+    - chmod +x /usr/local/bin/yq
+    - yq --version
+
+    - python -m pip install --upgrade pip
+    - python -m pip install "poetry==1.8.5" "bandit[toml]" "cyclonedx-bom"
+
+    - poetry config http-basic.internal gitlab-ci-token "$CI_JOB_TOKEN"
+
+    - poetry --version
+    - bandit --version
+    - jq --version
+    - python3 --version
+
+  script:
+    - git submodule sync --recursive
+    - git submodule update --init --recursive
+
+    - poetry install --no-interaction --sync --without dev
+
+    - mkdir -p artifacts
+
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - |
+      echo "=== Recording Bandit engine version ==="
+      bandit --version > artifacts/bandit-engine-version.txt 2>&1 || true
+      cat artifacts/bandit-engine-version.txt
+
+    - cyclonedx-py poetry --output-format JSON --output-file artifacts/sbom.json
+
+    - |
+      POLICY="security/bandit-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      echo "=== Active bandit-scope policy ==="
+      cat "$POLICY"
+      cp "$POLICY" artifacts/bandit-scope.yaml
+      
+    - |
+      UPDATE_TARGET=$(yq -r '.bandit.update.target' security/bandit-scope.yaml | \
+        sed "s|\${RUNTIME}|${RUNTIME}|g")
+      UPDATE_EXCLUDES=$(yq -r '.bandit.update.excludes | join(",")' security/bandit-scope.yaml)
+
+      echo "Update scan target:   $UPDATE_TARGET"
+      echo "Update scan excludes: $UPDATE_EXCLUDES"
+
+      BANDIT_UPDATE_TARGET_FOUND="false"
+      BANDIT_UPDATE_SCAN_ERROR="false"
+
+      if [ -d "$UPDATE_TARGET" ]; then
+        BANDIT_UPDATE_TARGET_FOUND="true"
+
+        set +e
+        bandit \
+          -r "$UPDATE_TARGET" \
+          -x "$UPDATE_EXCLUDES" \
+          -f json \
+          -o artifacts/bandit-update.json
+        BANDIT_UPDATE_EXIT_CODE=$?
+        set -e
+
+        if [ "$BANDIT_UPDATE_EXIT_CODE" -gt 1 ]; then
+          BANDIT_UPDATE_SCAN_ERROR="true"
+        fi
+      else
+        echo "WARNING: $UPDATE_TARGET not found"
+        BANDIT_UPDATE_EXIT_CODE=127
+        BANDIT_UPDATE_SCAN_ERROR="true"
+        echo '{"results":[]}' > artifacts/bandit-update.json
+      fi
+
+      {
+        echo "BANDIT_UPDATE_TARGET_FOUND=${BANDIT_UPDATE_TARGET_FOUND}"
+        echo "BANDIT_UPDATE_EXIT_CODE=${BANDIT_UPDATE_EXIT_CODE}"
+        echo "BANDIT_UPDATE_SCAN_ERROR=${BANDIT_UPDATE_SCAN_ERROR}"
+      } > artifacts/bandit-update.meta
+
+    - |
+      PLATFORM_TARGET=$(yq -r '.bandit.platform.target' security/bandit-scope.yaml)
+      PLATFORM_EXCLUDES=$(yq -r '.bandit.platform.excludes[].path' security/bandit-scope.yaml | paste -sd ',' -)
+
+      echo "Platform scan target:   $PLATFORM_TARGET"
+      echo "Platform scan excludes: $PLATFORM_EXCLUDES"
+
+      BANDIT_PLATFORM_TARGET_FOUND="false"
+      BANDIT_PLATFORM_SCAN_ERROR="false"
+
+      if [ -d "$PLATFORM_TARGET" ]; then
+        BANDIT_PLATFORM_TARGET_FOUND="true"
+
+        set +e
+        bandit \
+          -r "$PLATFORM_TARGET" \
+          -x "$PLATFORM_EXCLUDES" \
+          -f json \
+          -o artifacts/bandit-platform.json
+        BANDIT_PLATFORM_EXIT_CODE=$?
+        set -e
+
+        if [ "$BANDIT_PLATFORM_EXIT_CODE" -gt 1 ]; then
+          BANDIT_PLATFORM_SCAN_ERROR="true"
+        fi
+      else
+        echo "WARNING: $PLATFORM_TARGET not found"
+        BANDIT_PLATFORM_EXIT_CODE=127
+        BANDIT_PLATFORM_SCAN_ERROR="true"
+        echo '{"results":[]}' > artifacts/bandit-platform.json
+      fi
+
+      {
+        echo "BANDIT_PLATFORM_TARGET_FOUND=${BANDIT_PLATFORM_TARGET_FOUND}"
+        echo "BANDIT_PLATFORM_EXIT_CODE=${BANDIT_PLATFORM_EXIT_CODE}"
+        echo "BANDIT_PLATFORM_SCAN_ERROR=${BANDIT_PLATFORM_SCAN_ERROR}"
+      } > artifacts/bandit-platform.meta
+
+    
+    - |
+      extract_matrix() {
+        local file=$1
+        local prefix=$2
+
+        if [ ! -f "$file" ] || [ ! -s "$file" ] || ! jq empty "$file" >/dev/null 2>&1; then
+          echo "${prefix}_SEV_HIGH_CONF_HIGH=0"
+          echo "${prefix}_SEV_HIGH_CONF_MED=0"
+          echo "${prefix}_SEV_HIGH_CONF_LOW=0"
+          echo "${prefix}_SEV_MED_CONF_HIGH=0"
+          echo "${prefix}_SEV_MED_CONF_MED=0"
+          echo "${prefix}_SEV_MED_CONF_LOW=0"
+          echo "${prefix}_SEV_LOW_CONF_HIGH=0"
+          echo "${prefix}_SEV_LOW_CONF_MED=0"
+          echo "${prefix}_SEV_LOW_CONF_LOW=0"
+          echo "${prefix}_JSON_PARSE_ERROR=true"
+          return
+        fi
+
+        jq -r --arg prefix "$prefix" '
+          def cnt($sev; $conf):
+            [.results[]?
+              | select(.issue_severity == $sev and .issue_confidence == $conf)]
+            | length;
+
+          "\($prefix)_SEV_HIGH_CONF_HIGH=\(cnt("HIGH"; "HIGH"))",
+          "\($prefix)_SEV_HIGH_CONF_MED=\(cnt("HIGH"; "MEDIUM"))",
+          "\($prefix)_SEV_HIGH_CONF_LOW=\(cnt("HIGH"; "LOW"))",
+          "\($prefix)_SEV_MED_CONF_HIGH=\(cnt("MEDIUM"; "HIGH"))",
+          "\($prefix)_SEV_MED_CONF_MED=\(cnt("MEDIUM"; "MEDIUM"))",
+          "\($prefix)_SEV_MED_CONF_LOW=\(cnt("MEDIUM"; "LOW"))",
+          "\($prefix)_SEV_LOW_CONF_HIGH=\(cnt("LOW"; "HIGH"))",
+          "\($prefix)_SEV_LOW_CONF_MED=\(cnt("LOW"; "MEDIUM"))",
+          "\($prefix)_SEV_LOW_CONF_LOW=\(cnt("LOW"; "LOW"))"
+        ' "$file"
+
+        echo "${prefix}_JSON_PARSE_ERROR=false"
+      }
+
+      extract_matrix artifacts/bandit-update.json   BANDIT_UPDATE   >  artifacts/bandit.env
+      extract_matrix artifacts/bandit-platform.json BANDIT_PLATFORM >> artifacts/bandit.env
+
+      cat artifacts/bandit-update.meta >> artifacts/bandit.env
+      cat artifacts/bandit-platform.meta >> artifacts/bandit.env
+
+      BANDIT_SCAN_ERROR="false"
+      if grep -qE 'BANDIT_.*_SCAN_ERROR=true|BANDIT_.*_JSON_PARSE_ERROR=true' artifacts/bandit.env; then
+        BANDIT_SCAN_ERROR="true"
+      fi
+      echo "BANDIT_SCAN_ERROR=${BANDIT_SCAN_ERROR}" >> artifacts/bandit.env
+
+      echo "===== emitted dotenv ====="
+      cat artifacts/bandit.env
+      cp artifacts/bandit.env bandit.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/bandit-update.json
+      - artifacts/bandit-platform.json
+      - artifacts/bandit-update.meta
+      - artifacts/bandit-platform.meta
+      - artifacts/bandit-engine-version.txt
+      - artifacts/bandit-scope.yaml
+      - artifacts/sbom.json
+      - artifacts/bandit.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+yara_scan:
+  stage: security
+  image: python:3.11-slim
+  needs:
+    - job: fetch_artifact
+      artifacts: true
+
+  before_script:
+    - set -euo pipefail
+    - apt-get update
+    - |
+      apt-get install -y --no-install-recommends \
+        yara \
+        ripgrep \
+        ca-certificates \
+        git \
+        curl \
+        jq \
+        unzip \
+        file
+    - rm -rf /var/lib/apt/lists/*
+
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+
+    - curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+    - chmod +x /usr/local/bin/yq
+
+    - git config --global url."https://oauth2:${GITLAB_TOKEN}@gitlab.example.com:8000/".insteadOf "https://gitlab.example.com:8000/"
+
+    - yara --version
+    - rg --version | head -1
+    - yq --version
+    - jq --version
+
+  script:
+    - git submodule sync --recursive
+    - git submodule update --init --recursive
+    - mkdir -p artifacts scan-target/repo scan-target/wheel yara-rules
+
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - |
+      POLICY="security/yara-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      echo "=== Active yara-scope policy ==="
+      cat "$POLICY"
+      cp "$POLICY" artifacts/yara-scope.yaml
+
+    - |
+      REPO_SOURCE_FOUND="false"
+      if [ -d "runtimes/${RUNTIME}" ] && [ -n "$(ls -A "runtimes/${RUNTIME}" 2>/dev/null)" ]; then
+        echo "=== Preparing target: update_source ==="
+        cp -r "runtimes/${RUNTIME}/." scan-target/repo/
+        REPO_SOURCE_FOUND="true"
+      else
+        echo "WARNING: runtimes/${RUNTIME} not found or empty"
+      fi
+
+    - |
+      echo "=== Preparing target: update_artifact (wheel from fetch_artifact) ==="
+      WHEEL_FOUND="false"
+
+      if [ -n "${WHEEL_FILENAME:-}" ] && [ -f "artifacts/wheel/${WHEEL_FILENAME}" ]; then
+        WHEEL_FILE="artifacts/wheel/${WHEEL_FILENAME}"
+      else
+        WHEEL_FILE=$(find artifacts/wheel -name "*.whl" 2>/dev/null | head -1 || true)
+      fi
+
+      if [ -n "$WHEEL_FILE" ] && [ -f "$WHEEL_FILE" ]; then
+        echo "Found wheel: $WHEEL_FILE"
+        cp "$WHEEL_FILE" artifacts/scanned-wheel.whl
+        unzip -q "$WHEEL_FILE" -d scan-target/wheel/ || true
+        WHEEL_FOUND="true"
+      else
+        echo "WARNING: wheel artifact not found in artifacts/wheel/"
+      fi
+
+    - |
+      RULESET_URL=$(yq -r '.yara.ruleset.url' security/yara-scope.yaml)
+      RULESET_VERSION=$(yq -r '.yara.ruleset.version' security/yara-scope.yaml)
+      RULESET_PACKAGE=$(yq -r '.yara.ruleset.package' security/yara-scope.yaml)
+      ARCHIVE_MEMBER=$(yq -r '.yara.ruleset.archive_member' security/yara-scope.yaml)
+
+      echo "Downloading YARA-Forge rules:"
+      echo "  Package: $RULESET_PACKAGE"
+      echo "  Version: $RULESET_VERSION"
+      echo "  URL:     $RULESET_URL"
+
+      curl -fsSL -o /tmp/yara-forge.zip "$RULESET_URL"
+      unzip -q /tmp/yara-forge.zip -d /tmp/yara-forge/
+      cp "/tmp/yara-forge/${ARCHIVE_MEMBER}" yara-rules/yara-forge-core.yar
+
+      RULE_COUNT=$(grep -c "^rule " yara-rules/yara-forge-core.yar || echo "0")
+      echo "Loaded $RULE_COUNT YARA rules from $RULESET_PACKAGE v$RULESET_VERSION"
+
+      cp yara-rules/yara-forge-core.yar artifacts/yara-forge-core.yar
+
+
+    - |
+      HIGH_THRESHOLD=$(yq -r '.yara.ruleset.score_tiers.high_threshold' security/yara-scope.yaml)
+      MED_THRESHOLD=$(yq -r '.yara.ruleset.score_tiers.med_threshold' security/yara-scope.yaml)
+      echo "Score thresholds: HIGH >= $HIGH_THRESHOLD, MED >= $MED_THRESHOLD"
+
+    - |
+      echo "=== Recording engine and ruleset versions ==="
+      {
+        echo "yara_engine: $(yara --version)"
+        echo "ripgrep_engine: $(rg --version | head -1)"
+        echo "ruleset_package: $RULESET_PACKAGE"
+        echo "ruleset_version: $RULESET_VERSION"
+        echo "ruleset_rule_count: $RULE_COUNT"
+        echo "ruleset_url: $RULESET_URL"
+        echo "score_tier_high: $HIGH_THRESHOLD"
+        echo "score_tier_med: $MED_THRESHOLD"
+      } > artifacts/yara-engine-version.txt
+      cat artifacts/yara-engine-version.txt
+
+    
+    - |
+      echo "=== YARA scan: update_source (runtimes/${RUNTIME}) ===" \
+        | tee artifacts/yara-raw.txt
+      > artifacts/yara-errors.txt
+
+      set +e
+      if [ -d scan-target/repo ] && [ "$(ls -A scan-target/repo 2>/dev/null)" ]; then
+        yara -r -w \
+          --print-meta \
+          yara-rules/yara-forge-core.yar \
+          scan-target/repo/ \
+          >> artifacts/yara-raw.txt \
+          2>> artifacts/yara-errors.txt
+        YARA_REPO_EXIT=$?
+      else
+        echo "(empty target)" >> artifacts/yara-raw.txt
+        YARA_REPO_EXIT=0
+      fi
+
+      echo "" >> artifacts/yara-raw.txt
+      echo "=== YARA scan: update_artifact (wheel) ===" >> artifacts/yara-raw.txt
+
+      if [ -d scan-target/wheel ] && [ "$(ls -A scan-target/wheel 2>/dev/null)" ]; then
+        yara -r -w \
+          --print-meta \
+          yara-rules/yara-forge-core.yar \
+          scan-target/wheel/ \
+          >> artifacts/yara-raw.txt \
+          2>> artifacts/yara-errors.txt
+        YARA_WHEEL_EXIT=$?
+      else
+        echo "(empty target)" >> artifacts/yara-raw.txt
+        YARA_WHEEL_EXIT=0
+      fi
+      set -e
+
+      echo ""
+      echo "=== YARA results (tail -50) ==="
+      tail -n 50 artifacts/yara-raw.txt || true
+
+      if [ -s artifacts/yara-errors.txt ]; then
+        echo ""
+        echo "=== YARA stderr (tail -20) ==="
+        tail -n 20 artifacts/yara-errors.txt || true
+      fi
+
+      echo "YARA_REPO_EXIT_CODE=$YARA_REPO_EXIT"
+      echo "YARA_WHEEL_EXIT_CODE=$YARA_WHEEL_EXIT"
+
+
+    - |
+      MAX_SCORE=0
+      MATCH_COUNT=0
+      HIGH_SCORE_COUNT=0
+      MED_SCORE_COUNT=0
+      LOW_SCORE_COUNT=0
+
+      if [ -s artifacts/yara-raw.txt ]; then
+        SCORES=$(grep -oE 'score="?[0-9]+' artifacts/yara-raw.txt \
+          | grep -oE '[0-9]+' || true)
+
+        if [ -n "$SCORES" ]; then
+          MATCH_COUNT=$(echo "$SCORES" | wc -l | tr -d '[:space:]')
+          MAX_SCORE=$(echo "$SCORES" | sort -n | tail -1)
+          HIGH_SCORE_COUNT=$(echo "$SCORES" \
+            | awk -v t="$HIGH_THRESHOLD" '$1 >= t' \
+            | wc -l | tr -d '[:space:]')
+          MED_SCORE_COUNT=$(echo "$SCORES" \
+            | awk -v lo="$MED_THRESHOLD" -v hi="$HIGH_THRESHOLD" '$1 >= lo && $1 < hi' \
+            | wc -l | tr -d '[:space:]')
+          LOW_SCORE_COUNT=$(echo "$SCORES" \
+            | awk -v t="$MED_THRESHOLD" '$1 < t' \
+            | wc -l | tr -d '[:space:]')
+        fi
+      fi
+
+      echo "YARA_MAX_SCORE=$MAX_SCORE"
+      echo "YARA_MATCH_COUNT=$MATCH_COUNT"
+      echo "YARA_HIGH_SCORE_COUNT=$HIGH_SCORE_COUNT"
+      echo "YARA_MED_SCORE_COUNT=$MED_SCORE_COUNT"
+      echo "YARA_LOW_SCORE_COUNT=$LOW_SCORE_COUNT"
+
+
+    - |
+      echo "=== ripgrep scan: contextual search ==="
+      mkdir -p artifacts/ripgrep
+      > artifacts/ripgrep-raw.txt
+      > /tmp/rg-counts.tmp
+
+      CATEGORY_IDS=$(yq -r '.ripgrep.pattern_categories[].id' \
+        security/yara-scope.yaml 2>/dev/null || true)
+
+      RG_TOTAL_MATCHES=0
+      RG_CATEGORIES_MATCHED=""
+      RG_HAS_NONEMPTY_CATEGORIES="false"
+
+      if [ -z "$CATEGORY_IDS" ]; then
+        echo "INFO: ripgrep pattern_categories is empty in policy"
+        echo "      (operator's responsibility — see yara-scope.yaml)"
+      else
+        for CAT_ID in $CATEGORY_IDS; do
+          PATTERNS=$(yq -r \
+            ".ripgrep.pattern_categories[] | select(.id == \"$CAT_ID\") | .patterns[]?" \
+            security/yara-scope.yaml 2>/dev/null || true)
+
+          CAT_SEVERITY=$(yq -r \
+            ".ripgrep.pattern_categories[] | select(.id == \"$CAT_ID\") | .severity" \
+            security/yara-scope.yaml 2>/dev/null || echo "")
+
+          CAT_VAR=$(echo "$CAT_ID" | tr '[:lower:]-' '[:upper:]_')
+
+          if [ -z "$PATTERNS" ]; then
+            echo "Category '$CAT_ID' (severity=$CAT_SEVERITY): empty pattern list, skipping"
+            echo "RG_MATCH_${CAT_VAR}=0" >> /tmp/rg-counts.tmp
+            continue
+          fi
+
+          PATTERN_FILE="/tmp/rg-${CAT_ID}.patterns"
+          printf '%s\n' "$PATTERNS" | grep -v '^[[:space:]]*$' > "$PATTERN_FILE"
+
+          if [ ! -s "$PATTERN_FILE" ]; then
+            echo "Category '$CAT_ID' (severity=$CAT_SEVERITY): all patterns empty after sanitization, skipping"
+            echo "RG_MATCH_${CAT_VAR}=0" >> /tmp/rg-counts.tmp
+            rm -f "$PATTERN_FILE"
+            continue
+          fi
+
+          RG_HAS_NONEMPTY_CATEGORIES="true"
+
+          CAT_OUTPUT="artifacts/ripgrep/${CAT_ID}.txt"
+          rg --no-heading --with-filename --ignore-case \
+            -f "$PATTERN_FILE" \
+            --glob '!.git' \
+            --glob '!*.lock' \
+            --glob '!artifacts' \
+            --glob '!yara-rules' \
+            scan-target/ > "$CAT_OUTPUT" 2>/dev/null || true
+
+          rm -f "$PATTERN_FILE"
+
+          CAT_MATCHES=$(wc -l < "$CAT_OUTPUT" | tr -d '[:space:]')
+          CAT_MATCHES=${CAT_MATCHES:-0}
+
+          echo "Category '$CAT_ID' (severity=$CAT_SEVERITY): $CAT_MATCHES matches"
+          echo "RG_MATCH_${CAT_VAR}=${CAT_MATCHES}" >> /tmp/rg-counts.tmp
+
+          if [ "$CAT_MATCHES" -gt 0 ]; then
+            RG_CATEGORIES_MATCHED="${RG_CATEGORIES_MATCHED}${RG_CATEGORIES_MATCHED:+,}${CAT_ID}"
+            RG_TOTAL_MATCHES=$((RG_TOTAL_MATCHES + CAT_MATCHES))
+          fi
+
+          if [ -s "$CAT_OUTPUT" ]; then
+            echo "=== Category: $CAT_ID (severity=$CAT_SEVERITY) ===" \
+              >> artifacts/ripgrep-raw.txt
+            cat "$CAT_OUTPUT" >> artifacts/ripgrep-raw.txt
+            echo "" >> artifacts/ripgrep-raw.txt
+          fi
+        done
+      fi
+
+      echo "RG_TOTAL_MATCHES=$RG_TOTAL_MATCHES"
+      echo "RG_CATEGORIES_MATCHED=${RG_CATEGORIES_MATCHED:-none}"
+      echo "RG_HAS_NONEMPTY_CATEGORIES=$RG_HAS_NONEMPTY_CATEGORIES"
+
+    - |
+      YARA_SCAN_ERROR="false"
+      if [ "${YARA_REPO_EXIT:-0}" -ne 0 ] || [ "${YARA_WHEEL_EXIT:-0}" -ne 0 ]; then
+        YARA_SCAN_ERROR="true"
+      fi
+
+      [ -s artifacts/yara-raw.txt ] || YARA_SCAN_ERROR="true"
+
+      {
+        echo "YARA_MAX_SCORE=${MAX_SCORE}"
+        echo "YARA_MATCH_COUNT=${MATCH_COUNT}"
+        echo "YARA_HIGH_SCORE_COUNT=${HIGH_SCORE_COUNT}"
+        echo "YARA_MED_SCORE_COUNT=${MED_SCORE_COUNT}"
+        echo "YARA_LOW_SCORE_COUNT=${LOW_SCORE_COUNT}"
+        echo "YARA_REPO_EXIT_CODE=${YARA_REPO_EXIT:-0}"
+        echo "YARA_WHEEL_EXIT_CODE=${YARA_WHEEL_EXIT:-0}"
+        echo "YARA_WHEEL_FOUND=${WHEEL_FOUND}"
+        echo "YARA_REPO_SOURCE_FOUND=${REPO_SOURCE_FOUND}"
+        echo "YARA_SCAN_ERROR=${YARA_SCAN_ERROR}"
+
+        echo "RG_TOTAL_MATCHES=${RG_TOTAL_MATCHES}"
+        echo "RG_CATEGORIES_MATCHED=${RG_CATEGORIES_MATCHED:-none}"
+        echo "RG_HAS_NONEMPTY_CATEGORIES=${RG_HAS_NONEMPTY_CATEGORIES}"
+
+        if [ -s /tmp/rg-counts.tmp ]; then
+          cat /tmp/rg-counts.tmp
+        fi
+      } > artifacts/yara.env
+
+      echo "===== emitted yara.env ====="
+      cat artifacts/yara.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/yara-raw.txt
+      - artifacts/yara-errors.txt
+      - artifacts/ripgrep-raw.txt
+      - artifacts/ripgrep/
+      - artifacts/yara-forge-core.yar
+      - artifacts/yara-engine-version.txt
+      - artifacts/yara-scope.yaml
+      - artifacts/scanned-wheel.whl
+      - artifacts/yara.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+av_scan_pre_kvrt:
+  stage: security
+  needs:
+    - job: fetch_artifact
+      artifacts: true
+
+  image: ubuntu:22.04
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+
+  before_script:
+    - set -euo pipefail
+    - sed -i 's|http://archive.ubuntu.com/ubuntu|http://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+    - apt-get update -o Acquire::Retries=5
+    - apt-get install -y --no-install-recommends ca-certificates curl coreutils git unzip
+    - rm -rf /var/lib/apt/lists/*
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+
+  script:
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - mkdir -p artifacts scan-target/repo scan-target/wheel kvrt-bin
+
+    - |
+      REPO_SOURCE_FOUND="false"
+      if [ -d "runtimes/${RUNTIME}" ] && [ -n "$(ls -A "runtimes/${RUNTIME}" 2>/dev/null)" ]; then
+        echo "=== Preparing target: update_source ==="
+        cp -r "runtimes/${RUNTIME}/." scan-target/repo/
+        REPO_SOURCE_FOUND="true"
+      else
+        echo "WARNING: runtimes/${RUNTIME} not found or empty"
+      fi
+
+    - |
+      echo "=== Preparing target: update_artifact (wheel) ==="
+      WHEEL_FOUND="false"
+
+      if [ -n "${WHEEL_FILENAME:-}" ] && [ -f "artifacts/wheel/${WHEEL_FILENAME}" ]; then
+        WHEEL_FILE="artifacts/wheel/${WHEEL_FILENAME}"
+      else
+        WHEEL_FILE=$(find artifacts/wheel -name "*.whl" 2>/dev/null | head -1 || true)
+      fi
+
+      if [ -n "$WHEEL_FILE" ] && [ -f "$WHEEL_FILE" ]; then
+        echo "Found wheel: $WHEEL_FILE"
+        unzip -q "$WHEEL_FILE" -d scan-target/wheel/ || true
+        WHEEL_FOUND="true"
+      else
+        echo "WARNING: wheel artifact not found in artifacts/wheel/"
+      fi
+
+    - |
+      echo "=== Fetching kvrt.run from Generic Package Registry ==="
+
+      REGISTRY_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kvrt/latest/kvrt.run"
+      SHA_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kvrt/latest/kvrt.run.sha256"
+
+      echo "URL: $REGISTRY_URL"
+
+      curl -fsSL \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --output kvrt-bin/kvrt.run \
+        "$REGISTRY_URL"
+
+      SIZE=$(stat -c%s kvrt-bin/kvrt.run)
+      echo "Downloaded $SIZE bytes"
+
+      if curl -fsSL \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output kvrt-bin/kvrt.run.sha256 \
+          "$SHA_URL" 2>/dev/null; then
+
+        EXPECTED_SHA=$(awk '{print $1}' kvrt-bin/kvrt.run.sha256)
+        ACTUAL_SHA=$(sha256sum kvrt-bin/kvrt.run | awk '{print $1}')
+
+        echo "Expected SHA256: $EXPECTED_SHA"
+        echo "Actual SHA256:   $ACTUAL_SHA"
+
+        if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+          echo "FATAL: SHA256 mismatch — registry corruption?"
+          exit 1
+        fi
+
+        echo "✓ SHA256 verified"
+      else
+        echo "WARNING: kvrt.run.sha256 not found in registry, skipping integrity check"
+      fi
+
+      chmod +x kvrt-bin/kvrt.run
+      ls -la kvrt-bin/
+
+    - |
+      echo "=== Recording KVRT binary identity ==="
+      {
+        echo "binary: kvrt.run"
+        echo "sha256: $(sha256sum kvrt-bin/kvrt.run | awk '{print $1}')"
+        echo "size_bytes: $(stat -c%s kvrt-bin/kvrt.run)"
+        echo "registry_url: $REGISTRY_URL"
+      } > artifacts/kvrt-engine-version.txt
+
+      cat artifacts/kvrt-engine-version.txt
+
+    - |
+      echo "=== Running KVRT scan ==="
+      set +e
+
+      ./kvrt-bin/kvrt.run -- \
+        -accepteula \
+        -silent \
+        -dontencrypt \
+        -customonly \
+        -custom "$(pwd)/scan-target" \
+        > artifacts/kvrt-output.txt 2>&1
+
+      KVRT_EXIT=$?
+      set -e
+
+      echo "KVRT exit code: $KVRT_EXIT"
+      echo "----- KVRT output (tail -50) -----"
+      tail -n 50 artifacts/kvrt-output.txt || true
+
+    - |
+      echo "=== Collecting KVRT reports ==="
+
+      KVRT_DATA_DIR=""
+      REPORT_FOUND="false"
+
+      for dir in \
+        /var/opt/KVRT2024_Data \
+        /root/KVRT2024_Data \
+        "$PWD/KVRT2024_Data" \
+        "$PWD/kvrt-data/KVRT2024_Data"
+      do
+        if [ -d "$dir" ]; then
+          KVRT_DATA_DIR="$dir"
+          break
+        fi
+      done
+
+      if [ -n "$KVRT_DATA_DIR" ]; then
+        echo "KVRT data dir: $KVRT_DATA_DIR"
+        ls -la "$KVRT_DATA_DIR" || true
+
+        if [ -d "$KVRT_DATA_DIR/Reports" ]; then
+          mkdir -p artifacts/kvrt-reports
+          cp -r "$KVRT_DATA_DIR/Reports/." artifacts/kvrt-reports/ || true
+          REPORT_FOUND="true"
+
+          echo "Reports collected:"
+          ls -la artifacts/kvrt-reports/ || true
+        fi
+
+        if [ -d "$KVRT_DATA_DIR/Quarantine" ]; then
+          ls -la "$KVRT_DATA_DIR/Quarantine/" > artifacts/kvrt-quarantine-list.txt 2>/dev/null || true
+        fi
+      else
+        echo "WARNING: KVRT2024_Data directory not found"
+      fi
+
+    - |
+      SCAN_FINISHED_MARKER="false"
+      if [ -f artifacts/kvrt-output.txt ] && \
+         grep -qE "Scan (is )?finished" artifacts/kvrt-output.txt; then
+        SCAN_FINISHED_MARKER="true"
+      fi
+
+      FATAL_ERROR_MARKER="false"
+      if [ -f artifacts/kvrt-output.txt ] && \
+         grep -qiE "(scan (failed|error)|cannot (open|read|access)|fatal error)" \
+              artifacts/kvrt-output.txt; then
+        FATAL_ERROR_MARKER="true"
+      fi
+
+      DETECTED_FROM_STDOUT=0
+      if [ -f artifacts/kvrt-output.txt ]; then
+        DETECTED_FROM_STDOUT=$(grep -oiE "Detected: *[0-9]+|threats? detected" \
+          artifacts/kvrt-output.txt | grep -oE "[0-9]+" | head -1)
+        DETECTED_FROM_STDOUT=${DETECTED_FROM_STDOUT:-0}
+      fi
+
+      DETECTED_FROM_XML=0
+      if [ -d artifacts/kvrt-reports ]; then
+        DETECTED_FROM_XML=$(find artifacts/kvrt-reports -name "*.xml" -exec \
+          grep -hcE '(detected="true"|<ThreatInfo>|<Threat>)' {} + 2>/dev/null \
+          | awk '{s+=$1} END {print s+0}')
+      fi
+
+      DETECTED_COUNT=$(echo "$DETECTED_FROM_STDOUT $DETECTED_FROM_XML" \
+        | awk '{print ($1>$2)?$1:$2}')
+
+      {
+        echo "KVRT_PRE_EXIT_CODE=${KVRT_EXIT}"
+        echo "KVRT_PRE_DETECTED_COUNT=${DETECTED_COUNT}"
+        echo "KVRT_PRE_DETECTED_FROM_STDOUT=${DETECTED_FROM_STDOUT}"
+        echo "KVRT_PRE_DETECTED_FROM_XML=${DETECTED_FROM_XML}"
+        echo "KVRT_PRE_SCAN_FINISHED_MARKER=${SCAN_FINISHED_MARKER}"
+        echo "KVRT_PRE_FATAL_ERROR_MARKER=${FATAL_ERROR_MARKER}"
+        echo "KVRT_PRE_REPORT_FOUND=${REPORT_FOUND}"
+        echo "KVRT_PRE_WHEEL_FOUND=${WHEEL_FOUND}"
+        echo "KVRT_PRE_REPO_SOURCE_FOUND=${REPO_SOURCE_FOUND}"
+      } > artifacts/kvrt_pre.env
+
+      echo "===== emitted dotenv ====="
+      cat artifacts/kvrt_pre.env
+      cp artifacts/kvrt_pre.env kvrt_pre.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/kvrt-output.txt
+      - artifacts/kvrt-reports/
+      - artifacts/kvrt-quarantine-list.txt
+      - artifacts/kvrt-engine-version.txt
+      - artifacts/kvrt_pre.env
+      - kvrt_pre.env
+    reports:
+      dotenv: kvrt_pre.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+av_scan_pre_clamav:
+  stage: security
+  needs:
+    - job: fetch_artifact
+      artifacts: true
+
+  image: ubuntu:22.04
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+
+  before_script:
+    - set -euo pipefail
+    - sed -i 's|http://archive.ubuntu.com/ubuntu|http://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+    - apt-get update -o Acquire::Retries=5
+    - apt-get install -y --no-install-recommends ca-certificates curl coreutils git unzip clamav clamav-freshclam
+    - rm -rf /var/lib/apt/lists/*
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+
+  script:
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - mkdir -p artifacts scan-target/repo scan-target/wheel
+
+    - |
+      REPO_SOURCE_FOUND="false"
+      if [ -d "runtimes/${RUNTIME}" ] && [ -n "$(ls -A "runtimes/${RUNTIME}" 2>/dev/null)" ]; then
+        echo "=== Preparing target: update_source ==="
+        cp -r "runtimes/${RUNTIME}/." scan-target/repo/
+        REPO_SOURCE_FOUND="true"
+      else
+        echo "WARNING: runtimes/${RUNTIME} not found or empty"
+      fi
+
+    - |
+      echo "=== Preparing target: update_artifact (wheel) ==="
+      WHEEL_FOUND="false"
+
+      if [ -n "${WHEEL_FILENAME:-}" ] && [ -f "artifacts/wheel/${WHEEL_FILENAME}" ]; then
+        WHEEL_FILE="artifacts/wheel/${WHEEL_FILENAME}"
+      else
+        WHEEL_FILE=$(find artifacts/wheel -name "*.whl" 2>/dev/null | head -1 || true)
+      fi
+
+      if [ -n "$WHEEL_FILE" ] && [ -f "$WHEEL_FILE" ]; then
+        echo "Found wheel: $WHEEL_FILE"
+        unzip -q "$WHEEL_FILE" -d scan-target/wheel/ || true
+        WHEEL_FOUND="true"
+      else
+        echo "WARNING: wheel artifact not found in artifacts/wheel/"
+      fi
+
+    - |
+      echo "=== Fetching ClamAV DB from Generic Package Registry ==="
+      mkdir -p /var/lib/clamav
+      DB_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/clamav-db/latest"
+      for f in main.cvd daily.cvd bytecode.cvd; do
+        echo "Downloading $f ..."
+        curl -fsSL \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output "/var/lib/clamav/${f}" \
+          "${DB_BASE}/${f}"
+      done
+      echo "DB files in /var/lib/clamav:"
+      ls -la /var/lib/clamav/*.cvd
+
+    - |
+      echo "=== Recording engine and signature versions ==="
+      clamscan --version > artifacts/clamav-engine-version.txt 2>&1 || true
+      {
+        sigtool --info=/var/lib/clamav/main.cvd 2>/dev/null \
+          | grep -E '^(Version|Build time):' | sed 's/^/main: /' || true
+        sigtool --info=/var/lib/clamav/daily.cvd 2>/dev/null \
+          | grep -E '^(Version|Build time):' | sed 's/^/daily: /' || true
+      } > artifacts/clamav-sigversion.txt
+      echo "Engine version:"
+      cat artifacts/clamav-engine-version.txt || true
+      echo "Signature versions:"
+      cat artifacts/clamav-sigversion.txt || true
+
+    - |
+      echo "=== ClamAV scan ==="
+      set +e
+      clamscan \
+        --recursive \
+        --infected \
+        --max-filesize=500M \
+        --max-scansize=2000M \
+        scan-target > artifacts/clamav-report.txt 2>&1
+      CLAMSCAN_EXIT=$?
+      set -e
+      echo "clamscan exit code: $CLAMSCAN_EXIT"
+      echo "----- clamscan output (tail -50) -----"
+      tail -n 50 artifacts/clamav-report.txt || true
+
+    - |
+      INFECTED=$(grep -oE '^Infected files: [0-9]+' artifacts/clamav-report.txt \
+        | grep -oE '[0-9]+' | head -1 || echo "0")
+      INFECTED=${INFECTED:-0}
+      SIZE_WARNINGS=$(grep -cE 'WARNING:.*(too large|exceed)' artifacts/clamav-report.txt 2>/dev/null || echo "0")
+      SIZE_WARNINGS=$(echo "$SIZE_WARNINGS" | tr -d '[:space:]')
+      SCANNED_FILES=$(grep -oE '^Scanned files: [0-9]+' artifacts/clamav-report.txt \
+        | grep -oE '[0-9]+' | head -1 || echo "0")
+      SCANNED_FILES=${SCANNED_FILES:-0}
+      {
+        echo "CLAMAV_PRE_EXIT_CODE=${CLAMSCAN_EXIT}"
+        echo "CLAMAV_PRE_INFECTED_FILES=${INFECTED}"
+        echo "CLAMAV_PRE_SIZE_WARNINGS=${SIZE_WARNINGS}"
+        echo "CLAMAV_PRE_SCANNED_FILES=${SCANNED_FILES}"
+        echo "CLAMAV_PRE_WHEEL_FOUND=${WHEEL_FOUND}"
+        echo "CLAMAV_PRE_REPO_SOURCE_FOUND=${REPO_SOURCE_FOUND}"
+      } > artifacts/clamav_pre.env
+      echo "===== emitted dotenv ====="
+      cat artifacts/clamav_pre.env
+      cp artifacts/clamav_pre.env clamav_pre.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/clamav-report.txt
+      - artifacts/clamav-engine-version.txt
+      - artifacts/clamav-sigversion.txt
+      - artifacts/clamav_pre.env
+      - clamav_pre.env
+    reports:
+      dotenv: clamav_pre.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+grype_sbom:
+  stage: security
+  needs:
+    - job: bandit_and_sbom
+      artifacts: true
+
+  image: alpine:3.20
+
+  before_script:
+    - set -euo pipefail
+    - apk add --no-cache ca-certificates curl jq yq bash coreutils
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - update-ca-certificates
+    - curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+    - grype version
+    - yq --version
+    - jq --version
+
+  script:
+    - mkdir -p artifacts
+
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - |
+      POLICY="security/grype-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      echo "=== Active grype-scope policy ==="
+      cat "$POLICY"
+      cp "$POLICY" artifacts/grype-scope.yaml
+
+    - |
+      SBOM_FOUND="false"
+      if [ -f artifacts/sbom.json ] && [ -s artifacts/sbom.json ]; then
+        SBOM_FOUND="true"
+        echo "Found SBOM: artifacts/sbom.json"
+        echo "Size: $(stat -c%s artifacts/sbom.json) bytes"
+      else
+        echo "WARNING: artifacts/sbom.json not found or empty"
+      fi
+
+    - |
+      echo "=== Updating Grype vulnerability database ==="
+      set +e
+      grype db update 2>&1 | tee artifacts/grype-db-update.txt
+      DB_UPDATE_EXIT=$?
+      set -e
+      echo "grype db update exit code: $DB_UPDATE_EXIT"
+
+      grype db status > artifacts/grype-db-status.txt 2>&1 || true
+      echo "=== Grype DB status ==="
+      cat artifacts/grype-db-status.txt
+
+    - |
+      echo "=== Fetching CISA KEV catalog ==="
+      KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+      KEV_FETCH_OK="false"
+      if curl -fsSL -o artifacts/cisa-kev.json "$KEV_URL"; then
+        KEV_FETCH_OK="true"
+        KEV_SIZE=$(stat -c%s artifacts/cisa-kev.json)
+        KEV_CVE_COUNT=$(jq '.vulnerabilities | length' artifacts/cisa-kev.json 2>/dev/null || echo "0")
+        echo "Fetched KEV catalog: $KEV_SIZE bytes, $KEV_CVE_COUNT CVEs"
+      else
+        echo "WARNING: failed to fetch CISA KEV catalog"
+        echo '{"vulnerabilities":[]}' > artifacts/cisa-kev.json
+        KEV_CVE_COUNT=0
+      fi
+
+    - |
+      echo "=== Recording engine and database versions ==="
+      {
+        echo "grype_engine: $(grype version 2>&1 | grep -E '^Application:|^Version:' | head -2 | tr '\n' ' ')"
+        echo "grype_db_status: $(grep -oE 'Built:[^|]*' artifacts/grype-db-status.txt 2>/dev/null || echo 'unknown')"
+        echo "cisa_kev_cve_count: $KEV_CVE_COUNT"
+        echo "cisa_kev_url: $KEV_URL"
+      } > artifacts/grype-engine-version.txt
+      cat artifacts/grype-engine-version.txt
+
+    - |
+      echo "=== Running Grype scan on SBOM ==="
+
+      if [ "$SBOM_FOUND" = "true" ] && [ "$DB_UPDATE_EXIT" -eq 0 ]; then
+        set +e
+        grype sbom:artifacts/sbom.json \
+          --output json \
+          --file artifacts/grype-sbom-report.json \
+          2> artifacts/grype-sbom-errors.txt
+        GRYPE_EXIT=$?
+        set -e
+        echo "grype exit code: $GRYPE_EXIT"
+      else
+        echo "Skipping grype scan: SBOM_FOUND=$SBOM_FOUND, DB_UPDATE_EXIT=$DB_UPDATE_EXIT"
+        echo '{"matches":[]}' > artifacts/grype-sbom-report.json
+        GRYPE_EXIT=127
+      fi
+
+      if [ -s artifacts/grype-sbom-errors.txt ]; then
+        echo "=== Grype stderr (tail -20) ==="
+        tail -n 20 artifacts/grype-sbom-errors.txt
+      fi
+
+    - |
+      REPORT="artifacts/grype-sbom-report.json"
+
+      JSON_PARSE_ERROR="false"
+      if [ ! -s "$REPORT" ] || ! jq empty "$REPORT" >/dev/null 2>&1; then
+        JSON_PARSE_ERROR="true"
+        echo '{"matches":[]}' > "$REPORT"
+      fi
+
+      count_severity() {
+        local sev=$1
+        jq --arg sev "$sev" '[.matches[]?
+          | select(.vulnerability.severity == $sev)]
+          | length' "$REPORT"
+      }
+
+      count_severity_fixed() {
+        local sev=$1
+        jq --arg sev "$sev" '[.matches[]?
+          | select(.vulnerability.severity == $sev
+                   and .vulnerability.fix.state == "fixed")]
+          | length' "$REPORT"
+      }
+
+      CRITICAL_TOTAL=$(count_severity "Critical")
+      CRITICAL_FIXED=$(count_severity_fixed "Critical")
+      CRITICAL_UNFIXED=$((CRITICAL_TOTAL - CRITICAL_FIXED))
+
+      HIGH_TOTAL=$(count_severity "High")
+      HIGH_FIXED=$(count_severity_fixed "High")
+      HIGH_UNFIXED=$((HIGH_TOTAL - HIGH_FIXED))
+
+      MEDIUM_TOTAL=$(count_severity "Medium")
+      LOW_TOTAL=$(count_severity "Low")
+      NEGLIGIBLE_TOTAL=$(count_severity "Negligible")
+
+      TOTAL_MATCHES=$(jq '[.matches[]?] | length' "$REPORT")
+
+      KEV_MATCHES=0
+      if [ -s artifacts/cisa-kev.json ]; then
+        KEV_MATCHES=$(jq --slurpfile kev artifacts/cisa-kev.json \
+          '[.matches[]?
+            | .vulnerability.id as $cve
+            | select($kev[0].vulnerabilities[]?.cveID == $cve)]
+          | length' "$REPORT")
+      fi
+
+      echo "Counts: Critical=$CRITICAL_TOTAL (fixed=$CRITICAL_FIXED), High=$HIGH_TOTAL (fixed=$HIGH_FIXED), KEV=$KEV_MATCHES"
+
+    - |
+      GRYPE_SCAN_ERROR="false"
+      if [ "$DB_UPDATE_EXIT" -ne 0 ] || [ "$GRYPE_EXIT" -gt 1 ] || [ "$JSON_PARSE_ERROR" = "true" ]; then
+        GRYPE_SCAN_ERROR="true"
+      fi
+
+      {
+        echo "GRYPE_SBOM_TARGET=sbom"
+        echo "GRYPE_SBOM_SBOM_FOUND=${SBOM_FOUND}"
+        echo "GRYPE_SBOM_DB_UPDATE_EXIT=${DB_UPDATE_EXIT}"
+        echo "GRYPE_SBOM_KEV_FETCH_OK=${KEV_FETCH_OK}"
+        echo "GRYPE_SBOM_EXIT_CODE=${GRYPE_EXIT}"
+        echo "GRYPE_SBOM_JSON_PARSE_ERROR=${JSON_PARSE_ERROR}"
+        echo "GRYPE_SBOM_SCAN_ERROR=${GRYPE_SCAN_ERROR}"
+
+        echo "GRYPE_SBOM_CRITICAL_TOTAL=${CRITICAL_TOTAL}"
+        echo "GRYPE_SBOM_CRITICAL_FIXED=${CRITICAL_FIXED}"
+        echo "GRYPE_SBOM_CRITICAL_UNFIXED=${CRITICAL_UNFIXED}"
+        echo "GRYPE_SBOM_HIGH_TOTAL=${HIGH_TOTAL}"
+        echo "GRYPE_SBOM_HIGH_FIXED=${HIGH_FIXED}"
+        echo "GRYPE_SBOM_HIGH_UNFIXED=${HIGH_UNFIXED}"
+        echo "GRYPE_SBOM_MEDIUM_TOTAL=${MEDIUM_TOTAL}"
+        echo "GRYPE_SBOM_LOW_TOTAL=${LOW_TOTAL}"
+        echo "GRYPE_SBOM_NEGLIGIBLE_TOTAL=${NEGLIGIBLE_TOTAL}"
+        echo "GRYPE_SBOM_TOTAL_MATCHES=${TOTAL_MATCHES}"
+
+        echo "GRYPE_SBOM_KEV_MATCHES=${KEV_MATCHES}"
+      } > artifacts/grype-sbom.env
+
+      echo "===== emitted grype-sbom.env ====="
+      cat artifacts/grype-sbom.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/grype-sbom-report.json
+      - artifacts/grype-sbom-errors.txt
+      - artifacts/grype-db-update.txt
+      - artifacts/grype-db-status.txt
+      - artifacts/grype-engine-version.txt
+      - artifacts/grype-scope.yaml
+      - artifacts/cisa-kev.json
+      - artifacts/grype-sbom.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+build_image:
+  stage: build
+  image: docker:27
+  needs:
+    - job: fetch_artifact
+      artifacts: true
+  services:
+    - name: docker:27-dind
+      alias: docker
+      entrypoint: ["/bin/sh", "-c"]
+      command:
+        - |
+          cp /etc/docker/certs.d/gitlab.example.com:8000/ca.crt /usr/local/share/ca-certificates/gitlab.example.com.crt
+          cp /etc/docker/certs.d/registry.example.com:5050/ca.crt /usr/local/share/ca-certificates/registry.example.com.crt
+          update-ca-certificates
+          exec dockerd-entrypoint.sh --host=tcp://0.0.0.0:2375 --tls=false
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_DEPTH: "0"
+
+  script:
+    - set -euo pipefail
+    - echo "CI_REGISTRY=$CI_REGISTRY"
+    - echo "CI_REGISTRY_IMAGE=$CI_REGISTRY_IMAGE"
+    - echo "DOCKER_HOST=$DOCKER_HOST"
+    - docker version
+    - docker info --format 'Name={{.Name}} Root={{.DockerRootDir}}'
+
+    - git submodule sync --recursive
+    - git submodule update --init --recursive
+
+    - RUNTIME="${WHEEL_RUNTIME}"
+    - VERSION="${WHEEL_VERSION}"
+
+    - echo "RUNTIME=$RUNTIME"
+    - echo "VERSION=$VERSION"
+    - echo "WHEEL_FILENAME=${WHEEL_FILENAME}"
+    - echo "WHEEL_SHA256=${WHEEL_SHA256}"
+    - echo "WHEEL_SOURCE=${WHEEL_SOURCE}"
+    - echo "T001_VERIFIED=${T001_VERIFIED}"
+
+    - |
+      if [ "${WHEEL_FOUND}" != "true" ] || [ "${FETCH_SCAN_ERROR}" != "false" ]; then
+        echo "ERROR: fetch_artifact did not provide a valid wheel"
+        exit 1
+      fi
+
+    - |
+      ADMITTED_WHEEL="${WHEEL_FILENAME}"
+      mkdir -p ./admitted
+      cp "artifacts/wheel/${ADMITTED_WHEEL}" "./admitted/${ADMITTED_WHEEL}"
+
+      echo "${WHEEL_SHA256}  ./admitted/${ADMITTED_WHEEL}" | sha256sum -c -
+      echo "Admitted wheel staged: ./admitted/${ADMITTED_WHEEL}"
+
+    - IMAGE_TAG="mlserver-${RUNTIME}-${VERSION}"
+    - IMAGE="${CI_REGISTRY_IMAGE}:${IMAGE_TAG}"
+    - IMAGE_SHA="${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+
+    - echo "IMAGE=$IMAGE"
+    - echo "IMAGE_SHA=$IMAGE_SHA"
+
+    - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker build --build-arg ADMITTED_WHEEL="${WHEEL_FILENAME}" -t "$IMAGE" -t "$IMAGE_SHA" .
+    - docker push "$IMAGE"
+    - docker push "$IMAGE_SHA"
+
+    - |
+      {
+        echo "BUILT_IMAGE=${IMAGE}"
+        echo "BUILT_IMAGE_SHA=${IMAGE_SHA}"
+        echo "BUILT_IMAGE_TAG=${IMAGE_TAG}"
+        echo "BUILT_RUNTIME=${RUNTIME}"
+        echo "BUILT_VERSION=${VERSION}"
+        echo "BUILT_FROM_WHEEL=${WHEEL_FILENAME}"
+        echo "BUILT_FROM_WHEEL_SHA256=${WHEEL_SHA256}"
+      } > build.env
+
+      cat build.env
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - build.env
+    reports:
+      dotenv: build.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+av_scan_post_clamav:
+  stage: image_security
+  needs:
+    - job: build_image
+      artifacts: true
+    - job: av_scan_pre_clamav
+      artifacts: true
+
+  image: ubuntu:22.04
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+
+  before_script:
+    - set -euo pipefail
+    - sed -i 's|http://archive.ubuntu.com/ubuntu|http://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+    - apt-get update -o Acquire::Retries=5
+    - apt-get install -y --no-install-recommends ca-certificates curl coreutils clamav clamav-freshclam
+    - rm -rf /var/lib/apt/lists/*
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - |
+      if [ -n "${REGISTRY_CA_CERT:-}" ] && [ -f "$REGISTRY_CA_CERT" ]; then
+        cp "$REGISTRY_CA_CERT" /usr/local/share/ca-certificates/registry.example.com.crt
+      fi
+    - update-ca-certificates
+
+  script:
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - mkdir -p artifacts scan-target crane-bin
+
+    - |
+      IMAGE_FOUND="false"
+      if [ -n "${BUILT_IMAGE:-}" ]; then
+        IMAGE="${BUILT_IMAGE}"
+        IMAGE_FOUND="true"
+        echo "Target image: $IMAGE"
+        echo "Image tag:    ${BUILT_IMAGE_TAG:-unknown}"
+      else
+        echo "WARNING: BUILT_IMAGE not set — build_image did not provide image identity"
+        IMAGE=""
+      fi
+
+    - |
+      echo "=== Installing crane ==="
+      CRANE_VERSION="v0.20.2"
+      CRANE_URL="https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+      curl -fsSL -o /tmp/crane.tar.gz "$CRANE_URL"
+      tar -xzf /tmp/crane.tar.gz -C crane-bin/ crane
+      chmod +x crane-bin/crane
+      crane-bin/crane version
+
+    - |
+      echo "=== Configuring registry credentials ==="
+      mkdir -p ~/.docker
+      AUTH=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 -w 0)
+      cat > ~/.docker/config.json <<EOF
+      {
+        "auths": {
+          "${CI_REGISTRY}": {
+            "auth": "${AUTH}"
+          }
+        }
+      }
+      EOF
+      chmod 600 ~/.docker/config.json
+      echo "Configured docker auth for $CI_REGISTRY"
+
+    - |
+      echo "=== Exporting image filesystem ==="
+      IMAGE_EXPORTED="false"
+      if [ "$IMAGE_FOUND" = "true" ]; then
+        set +e
+        crane-bin/crane export "$IMAGE" - 2> artifacts/crane-errors.txt \
+          | tar -x --skip-old-files -C scan-target/ \
+            2>> artifacts/crane-errors.txt 
+        set -e
+        if [ -n "$(ls -A scan-target 2>/dev/null)" ]; then
+          IMAGE_EXPORTED="true"
+          EXPORTED_FILES=$(find scan-target -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+          EXPORTED_SIZE_MB=$(du -sm scan-target 2>/dev/null | awk '{print $1}')
+          echo "Exported $EXPORTED_FILES files, ~${EXPORTED_SIZE_MB} MB"
+        else
+          echo "WARNING: crane export produced no files"
+          if [ -s artifacts/crane-errors.txt ]; then
+            tail -n 20 artifacts/crane-errors.txt
+          fi
+        fi
+      else
+        echo "Skipping crane export: no BUILT_IMAGE"
+      fi
+
+    - |
+      echo "=== Fetching ClamAV DB from Generic Package Registry ==="
+      mkdir -p /var/lib/clamav
+      DB_BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/clamav-db/latest"
+      for f in main.cvd daily.cvd bytecode.cvd; do
+        echo "Downloading $f ..."
+        curl -fsSL \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output "/var/lib/clamav/${f}" \
+          "${DB_BASE}/${f}"
+      done
+      echo "DB files in /var/lib/clamav:"
+      ls -la /var/lib/clamav/*.cvd
+
+    - |
+      echo "=== Recording engine and signature versions ==="
+      clamscan --version > artifacts/clamav-engine-version.txt 2>&1 || true
+      {
+        sigtool --info=/var/lib/clamav/main.cvd 2>/dev/null \
+          | grep -E '^(Version|Build time):' | sed 's/^/main: /' || true
+        sigtool --info=/var/lib/clamav/daily.cvd 2>/dev/null \
+          | grep -E '^(Version|Build time):' | sed 's/^/daily: /' || true
+      } > artifacts/clamav-sigversion.txt
+      echo "Engine version:"
+      cat artifacts/clamav-engine-version.txt || true
+      echo "Signature versions:"
+      cat artifacts/clamav-sigversion.txt || true
+
+    - |
+      echo "=== ClamAV scan ==="
+      set +e
+      clamscan \
+        --recursive \
+        --infected \
+        --max-filesize=500M \
+        --max-scansize=4000M \
+        scan-target > artifacts/clamav-report.txt 2>&1
+      CLAMSCAN_EXIT=$?
+      set -e
+      echo "clamscan exit code: $CLAMSCAN_EXIT"
+      echo "----- clamscan output (tail -50) -----"
+      tail -n 50 artifacts/clamav-report.txt || true
+
+    - |
+      INFECTED=$(grep -oE '^Infected files: [0-9]+' artifacts/clamav-report.txt \
+        | grep -oE '[0-9]+' | head -1 || echo "0")
+      INFECTED=${INFECTED:-0}
+      SIZE_WARNINGS=$(grep -cE 'WARNING:.*(too large|exceed)' artifacts/clamav-report.txt 2>/dev/null || echo "0")
+      SIZE_WARNINGS=$(echo "$SIZE_WARNINGS" | tr -d '[:space:]')
+      SCANNED_FILES=$(grep -oE '^Scanned files: [0-9]+' artifacts/clamav-report.txt \
+        | grep -oE '[0-9]+' | head -1 || echo "0")
+      SCANNED_FILES=${SCANNED_FILES:-0}
+      {
+        echo "CLAMAV_POST_EXIT_CODE=${CLAMSCAN_EXIT}"
+        echo "CLAMAV_POST_INFECTED_FILES=${INFECTED}"
+        echo "CLAMAV_POST_SIZE_WARNINGS=${SIZE_WARNINGS}"
+        echo "CLAMAV_POST_SCANNED_FILES=${SCANNED_FILES}"
+        echo "CLAMAV_POST_IMAGE_FOUND=${IMAGE_FOUND}"
+        echo "CLAMAV_POST_IMAGE_EXPORTED=${IMAGE_EXPORTED}"
+      } > artifacts/clamav_post.env
+      echo "===== emitted clamav_post.env ====="
+      cat artifacts/clamav_post.env
+
+    - rm -f ~/.docker/config.json
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/clamav-report.txt
+      - artifacts/clamav-engine-version.txt
+      - artifacts/clamav-sigversion.txt
+      - artifacts/crane-errors.txt
+      - artifacts/clamav_post.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+av_scan_post_kvrt:
+  stage: image_security
+  needs:
+    - job: build_image
+      artifacts: true
+
+  image: ubuntu:22.04
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+
+  before_script:
+    - set -euo pipefail
+    - sed -i 's|http://archive.ubuntu.com/ubuntu|http://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+    - apt-get update -o Acquire::Retries=5
+    - apt-get install -y --no-install-recommends ca-certificates curl coreutils
+    - rm -rf /var/lib/apt/lists/*
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - |
+      if [ -n "${REGISTRY_CA_CERT:-}" ] && [ -f "$REGISTRY_CA_CERT" ]; then
+        cp "$REGISTRY_CA_CERT" /usr/local/share/ca-certificates/registry.example.com.crt
+      fi
+    - update-ca-certificates
+
+  script:
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - mkdir -p artifacts scan-target kvrt-bin crane-bin
+
+    - |
+      IMAGE_FOUND="false"
+      if [ -n "${BUILT_IMAGE:-}" ]; then
+        IMAGE="${BUILT_IMAGE}"
+        IMAGE_FOUND="true"
+        echo "Target image: $IMAGE"
+        echo "Image tag:    ${BUILT_IMAGE_TAG:-unknown}"
+      else
+        echo "WARNING: BUILT_IMAGE not set — build_image did not provide image identity"
+        IMAGE=""
+      fi
+
+    - |
+      echo "=== Installing crane ==="
+      CRANE_VERSION="v0.20.2"
+      CRANE_URL="https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+
+      curl -fsSL -o /tmp/crane.tar.gz "$CRANE_URL"
+      tar -xzf /tmp/crane.tar.gz -C crane-bin/ crane
+      chmod +x crane-bin/crane
+      crane-bin/crane version
+
+    - |
+      echo "=== Configuring registry credentials ==="
+      mkdir -p ~/.docker
+      AUTH=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 -w 0)
+      cat > ~/.docker/config.json <<EOF
+      {
+        "auths": {
+          "${CI_REGISTRY}": {
+            "auth": "${AUTH}"
+          }
+        }
+      }
+      EOF
+      chmod 600 ~/.docker/config.json
+      echo "Configured docker auth for $CI_REGISTRY"
+
+    - |
+      echo "=== Exporting image filesystem ==="
+      IMAGE_EXPORTED="false"
+
+      if [ "$IMAGE_FOUND" = "true" ]; then
+        set +e
+        crane-bin/crane export "$IMAGE" - 2> artifacts/crane-errors.txt | tar -x -C scan-target/
+        CRANE_EXIT=$?
+        set -e
+
+        if [ "$CRANE_EXIT" -eq 0 ] && [ -n "$(ls -A scan-target 2>/dev/null)" ]; then
+          IMAGE_EXPORTED="true"
+          EXPORTED_FILES=$(find scan-target -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+          EXPORTED_SIZE_MB=$(du -sm scan-target 2>/dev/null | awk '{print $1}')
+          echo "Exported $EXPORTED_FILES files, ~${EXPORTED_SIZE_MB} MB"
+        else
+          echo "WARNING: crane export failed (exit=$CRANE_EXIT)"
+          if [ -s artifacts/crane-errors.txt ]; then
+            tail -n 20 artifacts/crane-errors.txt
+          fi
+        fi
+      else
+        echo "Skipping crane export: no BUILT_IMAGE"
+      fi
+
+    - |
+      echo "=== Fetching kvrt.run from Generic Package Registry ==="
+
+      REGISTRY_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kvrt/latest/kvrt.run"
+      SHA_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kvrt/latest/kvrt.run.sha256"
+
+      echo "URL: $REGISTRY_URL"
+
+      curl -fsSL \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --output kvrt-bin/kvrt.run \
+        "$REGISTRY_URL"
+
+      SIZE=$(stat -c%s kvrt-bin/kvrt.run)
+      echo "Downloaded $SIZE bytes"
+
+      if curl -fsSL \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output kvrt-bin/kvrt.run.sha256 \
+          "$SHA_URL" 2>/dev/null; then
+
+        EXPECTED_SHA=$(awk '{print $1}' kvrt-bin/kvrt.run.sha256)
+        ACTUAL_SHA=$(sha256sum kvrt-bin/kvrt.run | awk '{print $1}')
+
+        echo "Expected SHA256: $EXPECTED_SHA"
+        echo "Actual SHA256:   $ACTUAL_SHA"
+
+        if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+          echo "FATAL: SHA256 mismatch — registry corruption?"
+          exit 1
+        fi
+
+        echo "✓ SHA256 verified"
+      else
+        echo "WARNING: kvrt.run.sha256 not found in registry, skipping integrity check"
+      fi
+
+      chmod +x kvrt-bin/kvrt.run
+      ls -la kvrt-bin/
+
+    - |
+      echo "=== Recording KVRT binary identity ==="
+      {
+        echo "binary: kvrt.run"
+        echo "sha256: $(sha256sum kvrt-bin/kvrt.run | awk '{print $1}')"
+        echo "size_bytes: $(stat -c%s kvrt-bin/kvrt.run)"
+        echo "registry_url: $REGISTRY_URL"
+      } > artifacts/kvrt-engine-version.txt
+
+      cat artifacts/kvrt-engine-version.txt
+
+    - |
+      echo "=== Running KVRT scan ==="
+      set +e
+
+      ./kvrt-bin/kvrt.run -- \
+        -accepteula \
+        -silent \
+        -dontencrypt \
+        -customonly \
+        -custom "$(pwd)/scan-target" \
+        > artifacts/kvrt-output.txt 2>&1
+
+      KVRT_EXIT=$?
+      set -e
+
+      echo "KVRT exit code: $KVRT_EXIT"
+      echo "----- KVRT output (tail -50) -----"
+      tail -n 50 artifacts/kvrt-output.txt || true
+
+    - |
+      echo "=== Collecting KVRT reports ==="
+
+      KVRT_DATA_DIR=""
+      REPORT_FOUND="false"
+
+      for dir in \
+        /var/opt/KVRT2024_Data \
+        /root/KVRT2024_Data \
+        "$PWD/KVRT2024_Data" \
+        "$PWD/kvrt-data/KVRT2024_Data"
+      do
+        if [ -d "$dir" ]; then
+          KVRT_DATA_DIR="$dir"
+          break
+        fi
+      done
+
+      if [ -n "$KVRT_DATA_DIR" ]; then
+        echo "KVRT data dir: $KVRT_DATA_DIR"
+        ls -la "$KVRT_DATA_DIR" || true
+
+        if [ -d "$KVRT_DATA_DIR/Reports" ]; then
+          mkdir -p artifacts/kvrt-reports
+          cp -r "$KVRT_DATA_DIR/Reports/." artifacts/kvrt-reports/ || true
+          REPORT_FOUND="true"
+
+          echo "Reports collected:"
+          ls -la artifacts/kvrt-reports/ || true
+        fi
+
+        if [ -d "$KVRT_DATA_DIR/Quarantine" ]; then
+          ls -la "$KVRT_DATA_DIR/Quarantine/" > artifacts/kvrt-quarantine-list.txt 2>/dev/null || true
+        fi
+      else
+        echo "WARNING: KVRT2024_Data directory not found"
+      fi
+
+    - |
+      SCAN_FINISHED_MARKER="false"
+      if [ -f artifacts/kvrt-output.txt ] && \
+         grep -qE "Scan (is )?finished" artifacts/kvrt-output.txt; then
+        SCAN_FINISHED_MARKER="true"
+      fi
+
+      FATAL_ERROR_MARKER="false"
+      if [ -f artifacts/kvrt-output.txt ] && \
+         grep -qiE "(scan (failed|error)|cannot (open|read|access)|fatal error)" \
+              artifacts/kvrt-output.txt; then
+        FATAL_ERROR_MARKER="true"
+      fi
+
+      DETECTED_FROM_STDOUT=0
+      if [ -f artifacts/kvrt-output.txt ]; then
+        DETECTED_FROM_STDOUT=$(grep -oiE "Detected: *[0-9]+|threats? detected" \
+          artifacts/kvrt-output.txt | grep -oE "[0-9]+" | head -1)
+        DETECTED_FROM_STDOUT=${DETECTED_FROM_STDOUT:-0}
+      fi
+
+      DETECTED_FROM_XML=0
+      if [ -d artifacts/kvrt-reports ]; then
+        DETECTED_FROM_XML=$(find artifacts/kvrt-reports -name "*.xml" -exec \
+          grep -hcE '(detected="true"|<ThreatInfo>|<Threat>)' {} + 2>/dev/null \
+          | awk '{s+=$1} END {print s+0}')
+      fi
+
+      DETECTED_COUNT=$(echo "$DETECTED_FROM_STDOUT $DETECTED_FROM_XML" \
+        | awk '{print ($1>$2)?$1:$2}')
+
+      {
+        echo "KVRT_POST_EXIT_CODE=${KVRT_EXIT}"
+        echo "KVRT_POST_DETECTED_COUNT=${DETECTED_COUNT}"
+        echo "KVRT_POST_DETECTED_FROM_STDOUT=${DETECTED_FROM_STDOUT}"
+        echo "KVRT_POST_DETECTED_FROM_XML=${DETECTED_FROM_XML}"
+        echo "KVRT_POST_SCAN_FINISHED_MARKER=${SCAN_FINISHED_MARKER}"
+        echo "KVRT_POST_FATAL_ERROR_MARKER=${FATAL_ERROR_MARKER}"
+        echo "KVRT_POST_REPORT_FOUND=${REPORT_FOUND}"
+        echo "KVRT_POST_IMAGE_FOUND=${IMAGE_FOUND}"
+        echo "KVRT_POST_IMAGE_EXPORTED=${IMAGE_EXPORTED}"
+      } > artifacts/kvrt_post.env
+
+      echo "===== emitted kvrt_post.env ====="
+      cat artifacts/kvrt_post.env
+
+    - rm -f ~/.docker/config.json
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/kvrt-output.txt
+      - artifacts/kvrt-reports/
+      - artifacts/kvrt-quarantine-list.txt
+      - artifacts/kvrt-engine-version.txt
+      - artifacts/crane-errors.txt
+      - artifacts/kvrt_post.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+grype_image:
+  stage: image_security
+  
+  needs:
+    - job: build_image
+      artifacts: true
+    - job: grype_sbom
+      artifacts: true
+
+  image: alpine:3.20
+
+  before_script:   
+    - set -euo pipefail
+    - apk add --no-cache ca-certificates curl jq yq bash coreutils
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt
+    - |
+      if [ -n "${REGISTRY_CA_CERT:-}" ] && [ -f "$REGISTRY_CA_CERT" ]; then
+        cp "$REGISTRY_CA_CERT" /usr/local/share/ca-certificates/registry.example.com.crt
+      fi
+    - update-ca-certificates
+    - curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | bash -s -- -b /usr/local/bin
+    - grype version
+    - yq --version
+    - jq --version
+    
+  script:
+    - mkdir -p artifacts
+
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - |
+      POLICY="security/grype-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      echo "=== Active grype-scope policy ==="
+      cat "$POLICY"
+      cp "$POLICY" artifacts/grype-scope.yaml
+
+    - |
+      IMAGE_FOUND="false"
+      if [ -n "${BUILT_IMAGE:-}" ]; then
+        IMAGE="${BUILT_IMAGE}"
+        IMAGE_FOUND="true"
+        echo "Target image: $IMAGE"
+        echo "Image tag:    ${BUILT_IMAGE_TAG:-unknown}"
+        echo "Built from wheel: ${BUILT_FROM_WHEEL:-unknown}"
+        echo "Built from SHA:   ${BUILT_FROM_WHEEL_SHA256:-unknown}"
+      else
+        echo "WARNING: BUILT_IMAGE not set — build_image did not provide image identity"
+        IMAGE=""
+      fi
+
+    - |
+      echo "=== Configuring registry credentials ==="
+      mkdir -p ~/.docker
+      AUTH=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+      cat > ~/.docker/config.json <<EOF
+      {
+        "auths": {
+          "${CI_REGISTRY}": {
+            "auth": "${AUTH}"
+          }
+        }
+      }
+      EOF
+      chmod 600 ~/.docker/config.json
+      echo "Configured docker auth for $CI_REGISTRY"
+
+    
+    - |
+      echo "=== Updating Grype vulnerability database ==="
+      set +e
+      grype db update 2>&1 | tee artifacts/grype-image-db-update.txt
+      DB_UPDATE_EXIT=$?
+      set -e
+      echo "grype db update exit code: $DB_UPDATE_EXIT"
+
+      grype db status > artifacts/grype-image-db-status.txt 2>&1 || true
+      echo "=== Grype DB status ==="
+      cat artifacts/grype-image-db-status.txt
+
+  
+    - |
+      echo "=== CISA KEV catalog ==="
+      KEV_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+      KEV_FETCH_OK="false"
+      KEV_REUSED="false"
+
+      if [ -f artifacts/cisa-kev.json ] && [ -s artifacts/cisa-kev.json ]; then
+        if jq empty artifacts/cisa-kev.json >/dev/null 2>&1; then
+          KEV_REUSED="true"
+          KEV_FETCH_OK="true"
+          KEV_CVE_COUNT=$(jq '.vulnerabilities | length' artifacts/cisa-kev.json 2>/dev/null || echo "0")
+          echo "Reusing CISA KEV from grype_sbom: $KEV_CVE_COUNT CVEs"
+        else
+          echo "WARNING: reused KEV file is invalid JSON, re-fetching"
+          rm -f artifacts/cisa-kev.json
+        fi
+      fi
+
+      if [ "$KEV_REUSED" = "false" ]; then
+        if curl -fsSL -o artifacts/cisa-kev.json "$KEV_URL"; then
+          KEV_FETCH_OK="true"
+          KEV_CVE_COUNT=$(jq '.vulnerabilities | length' artifacts/cisa-kev.json 2>/dev/null || echo "0")
+          echo "Fetched KEV catalog: $KEV_CVE_COUNT CVEs"
+        else
+          echo "WARNING: failed to fetch CISA KEV catalog"
+          echo '{"vulnerabilities":[]}' > artifacts/cisa-kev.json
+          KEV_CVE_COUNT=0
+        fi
+      fi
+
+    
+    - |
+      echo "=== Recording engine and database versions ==="
+      {
+        echo "grype_engine: $(grype version 2>&1 | grep -E '^Application:|^Version:' | head -2 | tr '\n' ' ')"
+        echo "grype_db_status: $(grep -oE 'Built:[^|]*' artifacts/grype-image-db-status.txt 2>/dev/null || echo 'unknown')"
+        echo "cisa_kev_cve_count: $KEV_CVE_COUNT"
+        echo "cisa_kev_reused: $KEV_REUSED"
+        echo "cisa_kev_url: $KEV_URL"
+        echo "target_image: ${IMAGE:-unknown}"
+        echo "target_image_tag: ${BUILT_IMAGE_TAG:-unknown}"
+        echo "built_from_wheel: ${BUILT_FROM_WHEEL:-unknown}"
+        echo "built_from_wheel_sha256: ${BUILT_FROM_WHEEL_SHA256:-unknown}"
+      } > artifacts/grype-image-engine-version.txt
+      cat artifacts/grype-image-engine-version.txt
+
+
+    - |
+      echo "=== Running Grype scan on container image ==="
+
+      if [ "$IMAGE_FOUND" = "true" ] && [ "$DB_UPDATE_EXIT" -eq 0 ]; then
+        set +e
+        grype "registry:${IMAGE}" \
+          --output json \
+          --file artifacts/grype-image-report.json \
+          2> artifacts/grype-image-errors.txt
+        GRYPE_EXIT=$?
+        set -e
+        echo "grype exit code: $GRYPE_EXIT"
+      else
+        echo "Skipping grype scan: IMAGE_FOUND=$IMAGE_FOUND, DB_UPDATE_EXIT=$DB_UPDATE_EXIT"
+        echo '{"matches":[]}' > artifacts/grype-image-report.json
+        GRYPE_EXIT=127
+      fi
+
+      if [ -s artifacts/grype-image-errors.txt ]; then
+        echo "=== Grype stderr (tail -20) ==="
+        tail -n 20 artifacts/grype-image-errors.txt
+      fi
+
+    - |
+      REPORT="artifacts/grype-image-report.json"
+
+      JSON_PARSE_ERROR="false"
+      if [ ! -s "$REPORT" ] || ! jq empty "$REPORT" >/dev/null 2>&1; then
+        JSON_PARSE_ERROR="true"
+        echo '{"matches":[]}' > "$REPORT"
+      fi
+
+      count_severity() {
+        local sev=$1
+        jq --arg sev "$sev" '[.matches[]?
+          | select(.vulnerability.severity == $sev)]
+          | length' "$REPORT"
+      }
+
+      count_severity_fixed() {
+        local sev=$1
+        jq --arg sev "$sev" '[.matches[]?
+          | select(.vulnerability.severity == $sev
+                   and .vulnerability.fix.state == "fixed")]
+          | length' "$REPORT"
+      }
+
+      CRITICAL_TOTAL=$(count_severity "Critical")
+      CRITICAL_FIXED=$(count_severity_fixed "Critical")
+      CRITICAL_UNFIXED=$((CRITICAL_TOTAL - CRITICAL_FIXED))
+
+      HIGH_TOTAL=$(count_severity "High")
+      HIGH_FIXED=$(count_severity_fixed "High")
+      HIGH_UNFIXED=$((HIGH_TOTAL - HIGH_FIXED))
+
+      MEDIUM_TOTAL=$(count_severity "Medium")
+      LOW_TOTAL=$(count_severity "Low")
+      NEGLIGIBLE_TOTAL=$(count_severity "Negligible")
+
+      TOTAL_MATCHES=$(jq '[.matches[]?] | length' "$REPORT")
+
+      KEV_MATCHES=0
+      if [ -s artifacts/cisa-kev.json ]; then
+        KEV_MATCHES=$(jq --slurpfile kev artifacts/cisa-kev.json \
+          '[.matches[]?
+            | .vulnerability.id as $cve
+            | select($kev[0].vulnerabilities[]?.cveID == $cve)]
+          | length' "$REPORT")
+      fi
+
+      echo "Counts: Critical=$CRITICAL_TOTAL (fixed=$CRITICAL_FIXED), High=$HIGH_TOTAL (fixed=$HIGH_FIXED), KEV=$KEV_MATCHES"
+
+    
+    - |
+      GRYPE_SCAN_ERROR="false"
+      if [ "$DB_UPDATE_EXIT" -ne 0 ] || [ "$GRYPE_EXIT" -gt 1 ] || [ "$JSON_PARSE_ERROR" = "true" ]; then
+        GRYPE_SCAN_ERROR="true"
+      fi
+
+      {
+        echo "GRYPE_IMAGE_TARGET=image"
+        echo "GRYPE_IMAGE_IMAGE_FOUND=${IMAGE_FOUND}"
+        echo "GRYPE_IMAGE_DB_UPDATE_EXIT=${DB_UPDATE_EXIT}"
+        echo "GRYPE_IMAGE_KEV_FETCH_OK=${KEV_FETCH_OK}"
+        echo "GRYPE_IMAGE_KEV_REUSED=${KEV_REUSED}"
+        echo "GRYPE_IMAGE_EXIT_CODE=${GRYPE_EXIT}"
+        echo "GRYPE_IMAGE_JSON_PARSE_ERROR=${JSON_PARSE_ERROR}"
+        echo "GRYPE_IMAGE_SCAN_ERROR=${GRYPE_SCAN_ERROR}"
+
+        echo "GRYPE_IMAGE_CRITICAL_TOTAL=${CRITICAL_TOTAL}"
+        echo "GRYPE_IMAGE_CRITICAL_FIXED=${CRITICAL_FIXED}"
+        echo "GRYPE_IMAGE_CRITICAL_UNFIXED=${CRITICAL_UNFIXED}"
+        echo "GRYPE_IMAGE_HIGH_TOTAL=${HIGH_TOTAL}"
+        echo "GRYPE_IMAGE_HIGH_FIXED=${HIGH_FIXED}"
+        echo "GRYPE_IMAGE_HIGH_UNFIXED=${HIGH_UNFIXED}"
+        echo "GRYPE_IMAGE_MEDIUM_TOTAL=${MEDIUM_TOTAL}"
+        echo "GRYPE_IMAGE_LOW_TOTAL=${LOW_TOTAL}"
+        echo "GRYPE_IMAGE_NEGLIGIBLE_TOTAL=${NEGLIGIBLE_TOTAL}"
+        echo "GRYPE_IMAGE_TOTAL_MATCHES=${TOTAL_MATCHES}"
+
+        echo "GRYPE_IMAGE_KEV_MATCHES=${KEV_MATCHES}"
+      } > artifacts/grype-image.env
+
+      echo "===== emitted grype-image.env ====="
+      cat artifacts/grype-image.env
+
+   
+    - rm -f ~/.docker/config.json
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/grype-image-report.json
+      - artifacts/grype-image-errors.txt
+      - artifacts/grype-image-db-update.txt
+      - artifacts/grype-image-db-status.txt
+      - artifacts/grype-image-engine-version.txt
+      - artifacts/grype-scope.yaml
+      - artifacts/cisa-kev.json
+      - artifacts/grype-image.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+deploy_to_test_k8s:
+  stage: deploy
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  needs:
+  - job: build_image
+    artifacts: true
+  before_script:
+    - echo "$KUBECONFIG_B64" | base64 -d > /tmp/kubeconfig.yaml
+    - export KUBECONFIG=/tmp/kubeconfig.yaml
+  script:
+    - IMAGE="${BUILT_IMAGE}"
+    - echo "Deploying image $IMAGE"
+
+    - kubectl apply -f k8s/namespace.yaml
+
+    - |
+      kubectl create secret docker-registry registry-credentials \
+        --docker-server="${CI_REGISTRY}" \
+        --docker-username="${CI_REGISTRY_USER}" \
+        --docker-password="${CI_REGISTRY_PASSWORD}" \
+        --namespace=mlserver-test \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+
+    - sed -i "s|MLSERVER_IMAGE_PLACEHOLDER|${IMAGE}|g" k8s/deployment.yaml
+    - kubectl apply -f k8s/service.yaml
+    - kubectl apply -f k8s/deployment.yaml
+    - kubectl rollout status deployment/mlserver -n mlserver-test --timeout=180s
+
+    - |
+      kubectl run smoke-check \
+        --image=curlimages/curl:latest \
+        --restart=Never \
+        --namespace=mlserver-test \
+        --rm \
+        --attach \
+        -- curl -sf http://mlserver.mlserver-test.svc.cluster.local:8080/v2/health/ready
+    - echo "DEPLOY_OK=true" > deploy.env
+    - echo "MLSERVER_ENDPOINT=http://mlserver.mlserver-test.svc.cluster.local:8080" >> deploy.env
+
+  after_script:
+    - if [ ! -f deploy.env ] || ! grep -q '^DEPLOY_OK=true' deploy.env; then
+        echo "DEPLOY_OK=false" > deploy.env
+      fi
+
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+    when: always
+    expire_in: 1 day
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+zap_scan:
+  stage: post_deploy_security
+  needs:
+    - job: deploy_to_test_k8s
+      artifacts: true
+
+  image:
+    name: ghcr.io/zaproxy/zaproxy:stable
+    entrypoint: [""]
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+
+  before_script:
+    - set -euo pipefail
+
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl
+    - export PATH="${PWD}:${PATH}"
+
+    - apt-get update -qq && apt-get install -y --no-install-recommends jq curl ca-certificates
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt 2>/dev/null || true
+    - update-ca-certificates 2>/dev/null || true
+
+    - echo "$KUBECONFIG_B64" | base64 -d > /tmp/kubeconfig.yaml
+    - export KUBECONFIG=/tmp/kubeconfig.yaml
+
+    - kubectl version --client=true
+    - jq --version
+    - zap.sh -version 2>&1 | head -3 || true
+
+  script:
+    - mkdir -p artifacts
+
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - |
+      POLICY="security/zap-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      echo "=== Active zap-scope policy ==="
+      cat "$POLICY"
+      cp "$POLICY" artifacts/zap-scope.yaml
+
+    - |
+      ZAP_DEPLOY_OK="false"
+      if [ "${DEPLOY_OK:-false}" = "true" ]; then
+        ZAP_DEPLOY_OK="true"
+        echo "Deploy OK; endpoint: ${MLSERVER_ENDPOINT:-unknown}"
+      else
+        echo "WARNING: DEPLOY_OK is not true — scan will likely fail"
+      fi
+
+    - |
+      echo "=== Recording ZAP engine version ==="
+      {
+        echo "zap_engine: $(zap.sh -version 2>&1 | head -1 || echo 'unknown')"
+        echo "kubectl_version: $(kubectl version --client=true 2>/dev/null | head -1 || echo 'unknown')"
+        echo "image_used: ghcr.io/zaproxy/zaproxy:stable"
+      } > artifacts/zap-engine-version.txt
+      cat artifacts/zap-engine-version.txt
+
+    - |
+      echo "=== Setting up port-forward ==="
+      kubectl port-forward svc/mlserver 8080:8080 -n mlserver-test &
+      PF_PID=$!
+      echo "port-forward PID: $PF_PID"
+      sleep 5
+
+      ZAP_ENDPOINT_READY="false"
+      if curl -sf --max-time 10 http://localhost:8080/v2/health/ready > /dev/null; then
+        ZAP_ENDPOINT_READY="true"
+        echo "Endpoint /v2/health/ready: OK"
+      else
+        echo "WARNING: endpoint /v2/health/ready is not responding"
+      fi
+
+    - |
+      echo "=== Fetching OpenAPI spec ==="
+      ZAP_OPENAPI_FETCHED="false"
+      OPENAPI_URL="http://localhost:8080/v2/docs/dataplane.json"
+
+      if curl -fsSL --max-time 10 -o artifacts/dataplane.json "$OPENAPI_URL"; then
+        if jq empty artifacts/dataplane.json 2>/dev/null; then
+          ZAP_OPENAPI_FETCHED="true"
+          OPENAPI_SIZE=$(stat -c%s artifacts/dataplane.json)
+          echo "Fetched OpenAPI spec: $OPENAPI_SIZE bytes"
+        else
+          echo "WARNING: OpenAPI spec downloaded but not valid JSON"
+        fi
+      else
+        echo "WARNING: failed to fetch OpenAPI spec from $OPENAPI_URL"
+      fi
+
+    - |
+      echo "=== Running ZAP API Scan ==="
+      mkdir -p /zap/wrk
+      set +e
+
+      if [ "$ZAP_OPENAPI_FETCHED" = "true" ]; then
+        zap-api-scan.py \
+          -t "$OPENAPI_URL" \
+          -f openapi \
+          -r /zap/wrk/zap-report.html \
+          -J /zap/wrk/zap-report.json \
+          -d \
+          > artifacts/zap-output.txt 2> artifacts/zap-errors.txt
+        ZAP_EXIT=$?
+      else
+        echo "Skipping ZAP scan: OpenAPI spec not available"
+        echo '{"site":[]}' > /zap/wrk/zap-report.json
+        ZAP_EXIT=127
+      fi
+      set -e
+
+      echo "ZAP exit code: $ZAP_EXIT"
+
+      cp /zap/wrk/zap-report.json artifacts/zap-report.json 2>/dev/null || \
+        echo '{"site":[]}' > artifacts/zap-report.json
+      cp /zap/wrk/zap-report.html artifacts/zap-report.html 2>/dev/null || true
+
+      if [ -s artifacts/zap-errors.txt ]; then
+        echo "=== ZAP stderr (tail -20) ==="
+        tail -n 20 artifacts/zap-errors.txt
+      fi
+
+    - |
+      REPORT="artifacts/zap-report.json"
+
+      JSON_PARSE_ERROR="false"
+      if [ ! -s "$REPORT" ] || ! jq empty "$REPORT" >/dev/null 2>&1; then
+        JSON_PARSE_ERROR="true"
+        echo '{"site":[]}' > "$REPORT"
+      fi
+
+      count_by_risk() {
+        local risk=$1
+        jq --arg risk "$risk" '[.site[]?.alerts[]?
+          | select(.riskcode == $risk)] | length' "$REPORT"
+      }
+
+      count_by_risk_conf() {
+        local risk=$1
+        local conf_min=$2
+        jq --arg risk "$risk" --arg cmin "$conf_min" '[.site[]?.alerts[]?
+          | select(.riskcode == $risk and (.confidence | tonumber) >= ($cmin | tonumber))]
+          | length' "$REPORT"
+      }
+
+      HIGH_RISK_TOTAL=$(count_by_risk "3")
+      HIGH_RISK_HIGH_CONF=$(count_by_risk_conf "3" "3")
+      MEDIUM_RISK_TOTAL=$(count_by_risk "2")
+      MEDIUM_RISK_HIGH_CONF=$(count_by_risk_conf "2" "3")
+      LOW_RISK_TOTAL=$(count_by_risk "1")
+      INFO_RISK_TOTAL=$(count_by_risk "0")
+
+      TOTAL_ALERTS=$(jq '[.site[]?.alerts[]?] | length' "$REPORT")
+
+      ALERT_NAMES=$(jq -r '[.site[]?.alerts[]?.name] | unique | join(",")' "$REPORT" \
+        2>/dev/null || echo "")
+
+      echo "Risk counts: High=$HIGH_RISK_TOTAL (HC=$HIGH_RISK_HIGH_CONF), Medium=$MEDIUM_RISK_TOTAL, Low=$LOW_RISK_TOTAL, Info=$INFO_RISK_TOTAL"
+
+    - |
+      ZAP_SCAN_ERROR="false"
+      if [ "$ZAP_DEPLOY_OK" = "false" ] \
+         || [ "$ZAP_ENDPOINT_READY" = "false" ] \
+         || [ "$ZAP_OPENAPI_FETCHED" = "false" ] \
+         || [ "$JSON_PARSE_ERROR" = "true" ] \
+         || [ "$ZAP_EXIT" -ge 3 ]; then
+        ZAP_SCAN_ERROR="true"
+      fi
+
+      {
+        echo "ZAP_DEPLOY_OK=${ZAP_DEPLOY_OK}"
+        echo "ZAP_ENDPOINT_READY=${ZAP_ENDPOINT_READY}"
+        echo "ZAP_OPENAPI_FETCHED=${ZAP_OPENAPI_FETCHED}"
+        echo "ZAP_EXIT_CODE=${ZAP_EXIT}"
+        echo "ZAP_JSON_PARSE_ERROR=${JSON_PARSE_ERROR}"
+        echo "ZAP_SCAN_ERROR=${ZAP_SCAN_ERROR}"
+
+        echo "ZAP_HIGH_RISK_TOTAL=${HIGH_RISK_TOTAL}"
+        echo "ZAP_HIGH_RISK_HIGH_CONF=${HIGH_RISK_HIGH_CONF}"
+        echo "ZAP_MEDIUM_RISK_TOTAL=${MEDIUM_RISK_TOTAL}"
+        echo "ZAP_MEDIUM_RISK_HIGH_CONF=${MEDIUM_RISK_HIGH_CONF}"
+        echo "ZAP_LOW_RISK_TOTAL=${LOW_RISK_TOTAL}"
+        echo "ZAP_INFO_RISK_TOTAL=${INFO_RISK_TOTAL}"
+        echo "ZAP_TOTAL_ALERTS=${TOTAL_ALERTS}"
+      } > artifacts/zap.env
+
+      echo "===== emitted zap.env ====="
+      cat artifacts/zap.env
+
+    - |
+      if kill -0 "$PF_PID" 2>/dev/null; then
+        kill "$PF_PID" 2>/dev/null || true
+        echo "port-forward terminated"
+      fi
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/zap-report.json
+      - artifacts/zap-report.html
+      - artifacts/zap-output.txt
+      - artifacts/zap-errors.txt
+      - artifacts/zap-engine-version.txt
+      - artifacts/zap-scope.yaml
+      - artifacts/dataplane.json
+      - artifacts/zap.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+schemathesis_fuzz:
+  stage: post_deploy_security
+  needs:
+    - job: deploy_to_test_k8s
+      artifacts: true
+
+  image: python:3.11-slim
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+
+  before_script:
+    - set -euo pipefail
+
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl wget ca-certificates jq xmlstarlet
+    - rm -rf /var/lib/apt/lists/*
+    - cp "$GITLAB_CA_CERT" /usr/local/share/ca-certificates/gitlab.example.com.crt 2>/dev/null || true
+    - update-ca-certificates 2>/dev/null || true
+
+    - curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+    - chmod +x /usr/local/bin/yq
+
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+
+    - pip install --quiet --no-cache-dir 'schemathesis<4'
+
+    - echo "$KUBECONFIG_B64" | base64 -d > /tmp/kubeconfig.yaml
+    - export KUBECONFIG=/tmp/kubeconfig.yaml
+
+    - kubectl version --client=true
+    - jq --version
+    - yq --version
+    - xmlstarlet --version 2>&1 | head -1 || true
+    - schemathesis --version
+
+  script:
+    - mkdir -p artifacts
+
+    - |
+      REST="${CI_COMMIT_REF_NAME#ci/bump-}"
+      VERSION="${REST##*-}"
+      RUNTIME="${REST%-${VERSION}}"
+      echo "RUNTIME=$RUNTIME"
+      echo "VERSION=$VERSION"
+
+    - |
+      POLICY="security/schemathesis-scope.yaml"
+      if [ ! -f "$POLICY" ]; then
+        echo "ERROR: policy file $POLICY not found"
+        exit 1
+      fi
+      echo "=== Active schemathesis-scope policy ==="
+      cat "$POLICY"
+      cp "$POLICY" artifacts/schemathesis-scope.yaml
+
+    - |
+      MAX_EXAMPLES=$(yq -r '.schemathesis.scan_options.max_examples' security/schemathesis-scope.yaml)
+      CHECKS=$(yq -r '.schemathesis.scan_options.checks' security/schemathesis-scope.yaml)
+      OPENAPI_PATH=$(yq -r '.schemathesis.target.openapi_path' security/schemathesis-scope.yaml)
+      HEALTH_PATH=$(yq -r '.schemathesis.target.health_path' security/schemathesis-scope.yaml)
+      echo "max_examples: $MAX_EXAMPLES"
+      echo "checks:       $CHECKS"
+      echo "openapi_path: $OPENAPI_PATH"
+      echo "health_path:  $HEALTH_PATH"
+
+    - |
+      SCHEMATHESIS_DEPLOY_OK="false"
+      if [ "${DEPLOY_OK:-false}" = "true" ]; then
+        SCHEMATHESIS_DEPLOY_OK="true"
+        echo "Deploy OK; endpoint: ${MLSERVER_ENDPOINT:-unknown}"
+      else
+        echo "WARNING: DEPLOY_OK is not true — scan will likely fail"
+      fi
+
+    - |
+      echo "=== Recording Schemathesis engine version ==="
+      {
+        echo "schemathesis_engine: $(schemathesis --version 2>&1 | head -1)"
+        echo "python_version: $(python3 --version)"
+        echo "kubectl_version: $(kubectl version --client=true 2>/dev/null | head -1 || echo 'unknown')"
+        echo "max_examples: $MAX_EXAMPLES"
+        echo "checks: $CHECKS"
+      } > artifacts/schemathesis-engine-version.txt
+      cat artifacts/schemathesis-engine-version.txt
+
+    - |
+      echo "=== Setting up port-forward ==="
+      kubectl port-forward svc/mlserver 8080:8080 -n mlserver-test &
+      PF_PID=$!
+      echo "port-forward PID: $PF_PID"
+      sleep 5
+
+      SCHEMATHESIS_ENDPOINT_READY="false"
+      if curl -sf --max-time 10 "http://localhost:8080${HEALTH_PATH}" > /dev/null; then
+        SCHEMATHESIS_ENDPOINT_READY="true"
+        echo "Endpoint ${HEALTH_PATH}: OK"
+      else
+        echo "WARNING: endpoint ${HEALTH_PATH} is not responding"
+      fi
+
+    - |
+      echo "=== Fetching OpenAPI spec ==="
+      SCHEMATHESIS_OPENAPI_FETCHED="false"
+      OPENAPI_URL="http://localhost:8080${OPENAPI_PATH}"
+
+      if curl -fsSL --max-time 10 -o artifacts/dataplane.json "$OPENAPI_URL"; then
+        if jq empty artifacts/dataplane.json 2>/dev/null; then
+          SCHEMATHESIS_OPENAPI_FETCHED="true"
+          OPENAPI_SIZE=$(stat -c%s artifacts/dataplane.json)
+          echo "Fetched OpenAPI spec: $OPENAPI_SIZE bytes"
+        else
+          echo "WARNING: OpenAPI spec downloaded but not valid JSON"
+        fi
+      else
+        echo "WARNING: failed to fetch OpenAPI spec from $OPENAPI_URL"
+      fi
+
+    - |
+      echo "=== Running Schemathesis fuzz ==="
+      set +e
+
+      if [ "$SCHEMATHESIS_OPENAPI_FETCHED" = "true" ]; then
+        schemathesis run "$OPENAPI_URL" \
+          --checks "$CHECKS" \
+          --hypothesis-max-examples="$MAX_EXAMPLES" \
+          --hypothesis-suppress-health-check=filter_too_much \
+          --junit-xml=artifacts/schemathesis-junit.xml \
+          > artifacts/schemathesis-output.txt 2> artifacts/schemathesis-errors.txt
+        SCHEMATHESIS_EXIT=$?
+      else
+        echo "Skipping Schemathesis run: OpenAPI spec not available"
+        echo '<?xml version="1.0"?><testsuites/>' > artifacts/schemathesis-junit.xml
+        SCHEMATHESIS_EXIT=127
+      fi
+      set -e
+
+      echo "Schemathesis exit code: $SCHEMATHESIS_EXIT"
+      echo "----- Schemathesis output (tail -50) -----"
+      tail -n 50 artifacts/schemathesis-output.txt 2>/dev/null || true
+
+      if [ -s artifacts/schemathesis-errors.txt ]; then
+        echo "----- Schemathesis stderr (tail -20) -----"
+        tail -n 20 artifacts/schemathesis-errors.txt
+      fi
+
+    - |
+      JUNIT="artifacts/schemathesis-junit.xml"
+      XML_PARSE_ERROR="false"
+
+      TOTAL_CHECKS=0
+      FAILED_CHECKS=0
+      ERRORS=0
+
+      if [ -s "$JUNIT" ] && xmlstarlet val -e "$JUNIT" >/dev/null 2>&1; then
+        TOTAL_CHECKS=$(xmlstarlet sel -t -v 'sum(//testsuite/@tests)' "$JUNIT" 2>/dev/null || echo "0")
+        FAILED_CHECKS=$(xmlstarlet sel -t -v 'sum(//testsuite/@failures)' "$JUNIT" 2>/dev/null || echo "0")
+        ERRORS=$(xmlstarlet sel -t -v 'sum(//testsuite/@errors)' "$JUNIT" 2>/dev/null || echo "0")
+
+        TOTAL_CHECKS=${TOTAL_CHECKS:-0}
+        FAILED_CHECKS=${FAILED_CHECKS:-0}
+        ERRORS=${ERRORS:-0}
+      else
+        XML_PARSE_ERROR="true"
+        echo "WARNING: schemathesis JUnit XML is missing or invalid"
+      fi
+
+      HAS_5XX_COUNT=0
+      SCHEMA_VIOLATIONS=0
+
+      if [ -s artifacts/schemathesis-output.txt ]; then
+        HAS_5XX_COUNT=$(grep -cE '\[5[0-9]{2}\]|status_code: 5[0-9]{2}|HTTP 5[0-9]{2}' \
+          artifacts/schemathesis-output.txt 2>/dev/null || echo "0")
+        HAS_5XX_COUNT=$(echo "$HAS_5XX_COUNT" | tr -d '[:space:]')
+        HAS_5XX_COUNT=${HAS_5XX_COUNT:-0}
+
+        SCHEMA_VIOLATIONS=$(grep -cE 'response_schema_conformance|SchemaError' \
+          artifacts/schemathesis-output.txt 2>/dev/null || echo "0")
+        SCHEMA_VIOLATIONS=$(echo "$SCHEMA_VIOLATIONS" | tr -d '[:space:]')
+        SCHEMA_VIOLATIONS=${SCHEMA_VIOLATIONS:-0}
+      fi
+
+      HAS_5XX="false"
+      [ "$HAS_5XX_COUNT" -gt 0 ] && HAS_5XX="true"
+
+      echo "Total=$TOTAL_CHECKS, Failed=$FAILED_CHECKS, Errors=$ERRORS, 5xx=$HAS_5XX_COUNT, SchemaViol=$SCHEMA_VIOLATIONS"
+
+    - |
+      SCHEMATHESIS_SCAN_ERROR="false"
+      if [ "$SCHEMATHESIS_DEPLOY_OK" = "false" ] \
+         || [ "$SCHEMATHESIS_ENDPOINT_READY" = "false" ] \
+         || [ "$SCHEMATHESIS_OPENAPI_FETCHED" = "false" ] \
+         || [ "$XML_PARSE_ERROR" = "true" ] \
+         || [ "$SCHEMATHESIS_EXIT" -ge 2 ]; then
+        SCHEMATHESIS_SCAN_ERROR="true"
+      fi
+
+      {
+        echo "SCHEMATHESIS_DEPLOY_OK=${SCHEMATHESIS_DEPLOY_OK}"
+        echo "SCHEMATHESIS_ENDPOINT_READY=${SCHEMATHESIS_ENDPOINT_READY}"
+        echo "SCHEMATHESIS_OPENAPI_FETCHED=${SCHEMATHESIS_OPENAPI_FETCHED}"
+        echo "SCHEMATHESIS_EXIT_CODE=${SCHEMATHESIS_EXIT}"
+        echo "SCHEMATHESIS_XML_PARSE_ERROR=${XML_PARSE_ERROR}"
+        echo "SCHEMATHESIS_SCAN_ERROR=${SCHEMATHESIS_SCAN_ERROR}"
+        echo "SCHEMATHESIS_MAX_EXAMPLES=${MAX_EXAMPLES}"
+        echo "SCHEMATHESIS_CHECKS=${CHECKS}"
+
+        echo "SCHEMATHESIS_TOTAL_CHECKS=${TOTAL_CHECKS}"
+        echo "SCHEMATHESIS_FAILED_CHECKS=${FAILED_CHECKS}"
+        echo "SCHEMATHESIS_ERRORS=${ERRORS}"
+
+        echo "SCHEMATHESIS_HAS_5XX=${HAS_5XX}"
+        echo "SCHEMATHESIS_HAS_5XX_COUNT=${HAS_5XX_COUNT}"
+        echo "SCHEMATHESIS_SCHEMA_VIOLATIONS=${SCHEMA_VIOLATIONS}"
+      } > artifacts/schemathesis.env
+
+      echo "===== emitted schemathesis.env ====="
+      cat artifacts/schemathesis.env
+
+    - |
+      if kill -0 "$PF_PID" 2>/dev/null; then
+        kill "$PF_PID" 2>/dev/null || true
+        echo "port-forward terminated"
+      fi
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/schemathesis-output.txt
+      - artifacts/schemathesis-errors.txt
+      - artifacts/schemathesis-junit.xml
+      - artifacts/schemathesis-engine-version.txt
+      - artifacts/schemathesis-scope.yaml
+      - artifacts/dataplane.json
+      - artifacts/schemathesis.env
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+normalize_reports:
+  stage: normalization
+  image: python:3.11-slim
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    NORMALIZE_INPUT_DIR: "normalized-input"
+    NORMALIZE_OUTPUT: "artifacts/normalized.json"
+
+  needs:
+    - job: av_scan_pre_clamav
+      artifacts: true
+    - job: av_scan_pre_kvrt
+      artifacts: true
+    - job: bandit_and_sbom
+      artifacts: true
+    - job: yara_scan
+      artifacts: true
+    - job: grype_sbom
+      artifacts: true
+    - job: av_scan_post_clamav
+      artifacts: true
+    - job: av_scan_post_kvrt
+      artifacts: true
+    - job: grype_image
+      artifacts: true
+    - job: zap_scan
+      artifacts: true
+      optional: true
+    - job: schemathesis_fuzz
+      artifacts: true
+      optional: true
+
+  before_script:
+    - set -euo pipefail
+    - python3 --version
+
+  script:
+    - mkdir -p "$NORMALIZE_INPUT_DIR" artifacts
+
+    - |
+      collect() {
+        local src="$1"
+        if [ -f "$src" ]; then
+          cp "$src" "$NORMALIZE_INPUT_DIR/"
+          echo "  collected: $src"
+        else
+          echo "  MISSING:   $src (tool artifact absent -> ⊥)"
+        fi
+      }
+
+      echo "=== Collecting raw tool artifacts ==="
+      collect artifacts/clamav_pre.env
+      collect artifacts/clamav_post.env
+      collect artifacts/kvrt_pre.env
+      collect artifacts/kvrt_post.env
+      collect artifacts/yara.env
+      collect artifacts/bandit.env
+      collect artifacts/grype-sbom.env
+      collect artifacts/grype-image.env
+      collect artifacts/zap.env
+      collect artifacts/schemathesis.env
+
+      echo ""
+      echo "=== Collected input directory ==="
+      ls -la "$NORMALIZE_INPUT_DIR/"
+
+    - |
+      echo "=== Running Level-1 normalization ==="
+      python3 normalize.py "$NORMALIZE_INPUT_DIR" "$NORMALIZE_OUTPUT"
+
+    - |
+      echo "=== Validating normalized.json ==="
+      python3 - "$NORMALIZE_OUTPUT" <<'PY'
+      import json, sys
+      path = sys.argv[1]
+      with open(path, encoding="utf-8") as f:
+          data = json.load(f)
+      assert data.get("schema_version") == "1.0", "bad schema_version"
+      assert set(data.get("sigma", {})) == {"T003", "T004", "T005"}, "sigma incomplete"
+      tools = data.get("tools", {})
+      expected = {"clamav","kvrt","yara","ripgrep","bandit","grype","zap","schemathesis"}
+      assert expected <= set(tools), f"tools missing: {expected - set(tools)}"
+      print("OK: schema_version, sigma, tools present")
+      PY
+
+      echo ""
+      echo "===== normalized.json ====="
+      cat "$NORMALIZE_OUTPUT"
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/normalized.json
+      - normalized-input/
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+      when: on_success
+    - when: never
+
+automaton_verdict:
+  stage: decision
+  image: python:3.11-slim
+
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    NORMALIZED_INPUT: "artifacts/normalized.json"
+    VERDICT_OUTPUT: "artifacts/verdict.json"
+    KII_CATEGORY: "3"
+
+  needs:
+    - job: normalize_reports
+      artifacts: true
+    - job: fetch_artifact
+      artifacts: true
+
+  before_script:
+    - set -euo pipefail
+    - python3 --version
+
+  script:
+    - mkdir -p artifacts
+
+    - |
+      echo "=== Checking automaton inputs ==="
+      if [ ! -f "$NORMALIZED_INPUT" ]; then
+        echo "FATAL: $NORMALIZED_INPUT not found (normalize stage failed?)"
+        exit 1
+      fi
+      echo "  normalized.json: present"
+
+    - |
+      echo "=== Deriving supply_verified ==="
+      SUPPLY_VERIFIED="${SUPPLY_VERIFIED:-false}"
+      echo "  WHEEL_FOUND=${WHEEL_FOUND:-<unset>}"
+      echo "  FETCH_SCAN_ERROR=${FETCH_SCAN_ERROR:-<unset>}"
+      echo "  -> supply_verified=$SUPPLY_VERIFIED"
+
+    - |
+      echo "=== Running EFSM automaton (Levels 2-3) ==="
+      OVERRIDES="--kii_category=$KII_CATEGORY --supply_verified=$SUPPLY_VERIFIED"
+      if [ -n "${EXPERT_VERDICT:-}" ]; then
+        OVERRIDES="$OVERRIDES --expert_verdict=$EXPERT_VERDICT"
+        echo "  expert_verdict (повторный прогон): $EXPERT_VERDICT"
+      else
+        echo "  expert_verdict не задан — первый прогон (⊥)"
+      fi
+
+      python3 automaton.py "$NORMALIZED_INPUT" /nonexistent-context.json \
+        "$VERDICT_OUTPUT" $OVERRIDES
+
+    - |
+      echo ""
+      echo "===== verdict.json ====="
+      cat "$VERDICT_OUTPUT"
+      echo ""
+
+      VERDICT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$VERDICT_OUTPUT")
+      FINAL_STATE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['final_state'])" "$VERDICT_OUTPUT")
+      echo "=== Final verdict: $VERDICT (state $FINAL_STATE) ==="
+
+    - |
+      case "$VERDICT" in
+        ALLOW)
+          echo "Обновление допускается. Job зелёная, мерж разрешён."
+          ;;
+        MANUAL_REVIEW)
+          echo "Требуется экспертиза T006 (тест(ы) в статусе YELLOW)."
+          echo "Эксперт: изучите verdict.json (conflict_log, conflict_sources),"
+          echo "затем перезапустите эту job (retry) с переменной EXPERT_VERDICT:"
+          echo "  NDV_REFUTED          — подозрение снято, YELLOW->GREEN"
+          echo "  NDV_NON_DESTRUCTIVE  — НДВ без деструктива, остаётся MANUAL_REVIEW"
+          echo "  NDV_DESTRUCTIVE      — НДВ подтверждены, итог REJECT"
+          echo "  T006_IMPOSSIBLE      — анализ невозможен, итог REJECT"
+          exit 1
+          ;;
+        REJECT)
+          echo "Обновление НЕ допускается (вето / отсутствие отчёта / НДВ)."
+          echo "Перезапуск с EXPERT_VERDICT результат не изменит:"
+          echo "автомат не доходит до экспертного шага T006."
+          exit 1
+          ;;
+        *)
+          echo "FATAL: неизвестный вердикт '$VERDICT'"
+          exit 1
+          ;;
+      esac
+
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - artifacts/verdict.json
+
+  rules:
+  - if: '$CI_COMMIT_BRANCH =~ /^ci\/bump-/'
+    when: manual
+    allow_failure: false
+  - when: never
