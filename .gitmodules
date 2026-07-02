@@ -1,3 +1,6 @@
 [submodule "runtimes/scikit-learn"]
 	path = runtimes/scikit-learn
 	url =  https://gitlab.example.com:8000/root/scikit-learn.git
+[submodule "dependency-access-pipeline"]
+	path = dependency-access-pipeline
+	url = https://github.com/sekreta-r/dependency-access-pipeline.git
